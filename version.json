@@ -6,7 +6,7 @@
     { "name": "OuterAIManager.cs" },
     { "name": "OuterAIUpdateLog.cs" },
     { "name": "LocalPlayerTeleport.cs" },
-    { "name": "PlayerDeathHandeler.cs" },
+    { "name": "PlayerDeathHandler.cs" },
     { "name": "SkinSlotMap.cs" }
   ]
 }
