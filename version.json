@@ -1,6 +1,7 @@
 {
-  "version": "1.1",
-  "notes": "Adds the Outer AI Manager, Hierarchy icons and the update button",
+  "version": "1.2",
+  "tosVersion": "1",
+  "notes": "Adds the TOS agreement pop up",
   "files": [
     { "name": "OuterAI.cs" },
     { "name": "OuterAIManager.cs" },
