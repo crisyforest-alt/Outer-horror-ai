@@ -1,0 +1,12 @@
+{
+  "version": "1.1",
+  "notes": "Adds the Outer AI Manager, Hierarchy icons and the update button",
+  "files": [
+    { "name": "OuterAI.cs" },
+    { "name": "OuterAIManager.cs" },
+    { "name": "OuterAIUpdateLog.cs" },
+    { "name": "LocalPlayerTeleport.cs" },
+    { "name": "PlayerDeathHandeler.cs" },
+    { "name": "SkinSlotMap.cs" }
+  ]
+}
