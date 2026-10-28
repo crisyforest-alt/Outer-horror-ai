@@ -20,6 +20,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEditor;
+using UnityEditorInternal;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -51,6 +52,9 @@ internal static class OuterAIUpdateData
         new Block("HIERARCHY COLORS AND ICONS",
             "Monsters, the manager and the Walk, Kill and Detect objects now get colors, badges and icons in the Hierarchy that match your theme. Turn it off in the Outer AI menu."),
 
+        new Block("TERMS OF SERVICE",
+            "The first time you import Outer AI, and any time the Terms of Service change, a pop up asks you to agree to the TOS before the Update Log shows."),
+
         new Block("NEW UPDATE LOG",
             "This screen. It opens once whenever a new version of Outer AI is imported. You can open it any time from Outer AI > Update Log."),
     };
@@ -76,23 +80,29 @@ internal static class OuterAIUpdateCheck
         return v as string;
     }
 
+    internal static void ShowLogIfNew()
+    {
+        string current = ScriptVersion();
+        if (string.IsNullOrEmpty(current)) return;
+        // Saved per project (not shared between projects), so a new project that imports Outer AI sees it too.
+        string seen = EditorUserSettings.GetConfigValue(Key);
+        if (seen != current)
+        {
+            EditorUserSettings.SetConfigValue(Key, current); // switch the value so it only shows once
+            OuterAIUpdateLogWindow.Open();
+        }
+    }
+
     private static void Check()
     {
         if (Application.isBatchMode) return;
         if (EditorApplication.isPlayingOrWillChangePlaymode) return;
         if (EditorApplication.isCompiling || EditorApplication.isUpdating) { EditorApplication.delayCall += Check; return; }
 
-        string current = ScriptVersion();
-        if (!string.IsNullOrEmpty(current))
-        {
-            // Saved per project (not shared between projects), so a new project that imports Outer AI sees it too.
-            string seen = EditorUserSettings.GetConfigValue(Key);
-            if (seen != current)
-            {
-                EditorUserSettings.SetConfigValue(Key, current); // switch the value so it only shows once
-                OuterAIUpdateLogWindow.Open();
-            }
-        }
+        // Terms of Service first. The Update Log waits until the TOS is accepted.
+        string tos = OuterAITos.LocalVersion();
+        if (OuterAITos.NeedsAccept(tos)) OuterAITos.Require(tos);
+        else ShowLogIfNew();
 
         OuterAIUpdater.Check(true); // quiet check of GitHub
     }
@@ -100,7 +110,7 @@ internal static class OuterAIUpdateCheck
 
 // ============================== the GitHub updater ==============================
 [System.Serializable] internal class OuterAIManifestFile { public string name; public string sha256; }
-[System.Serializable] internal class OuterAIManifest { public string version; public string notes; public OuterAIManifestFile[] files; }
+[System.Serializable] internal class OuterAIManifest { public string version; public string tosVersion; public string notes; public OuterAIManifestFile[] files; }
 
 internal static class OuterAIUpdater
 {
@@ -131,7 +141,7 @@ internal static class OuterAIUpdater
     private static string MapPath { get { return Path.Combine(BackupDir, "map.txt"); } }
     private static bool ValidName(string n) { return !string.IsNullOrEmpty(n) && Regex.IsMatch(n, @"^[A-Za-z0-9_\-]+\.cs$"); }
 
-    private static bool IsNewer(string remote, string local)
+    internal static bool IsNewer(string remote, string local)
     {
         if (string.IsNullOrEmpty(remote)) return false;
         if (string.IsNullOrEmpty(local)) return true;
@@ -185,6 +195,8 @@ internal static class OuterAIUpdater
             manifest = m;
             remoteVersion = m.version;
             remoteNotes = m.notes ?? "";
+            // A new TOS on GitHub (version.json "tosVersion") pops up the agree window too, even without a script update.
+            if (OuterAITos.NeedsAcceptRemote(m.tosVersion)) OuterAITos.Require(m.tosVersion);
             string local = OuterAIUpdateCheck.ScriptVersion();
             if (IsNewer(m.version, local))
             {
@@ -205,6 +217,7 @@ internal static class OuterAIUpdater
     internal static void StartUpdate()
     {
         if (state != State.Available || manifest == null) return;
+        if (OuterAITos.Guard()) return;
         StringBuilder list = new StringBuilder();
         foreach (OuterAIManifestFile f in manifest.files) list.Append("  - ").Append(f.name).Append('\n');
         if (!EditorUtility.DisplayDialog("Update Outer AI to " + manifest.version + "?",
@@ -384,6 +397,7 @@ internal static class OuterAIUpdater
         string[] classes = { "OuterAI", "OuterAIManager", "OuterAIUpdateLogWindow", "LocalPlayerTeleport", "PlayerDeathHandler", "" };
         StringBuilder sb = new StringBuilder();
         sb.Append("{\n  \"version\": \"").Append(OuterAIUpdateCheck.ScriptVersion() ?? "1.0").Append("\",\n");
+        sb.Append("  \"tosVersion\": \"").Append(OuterAITos.LocalVersion() ?? "1").Append("\",\n");
         sb.Append("  \"notes\": \"Write what is new here\",\n  \"files\": [\n");
         List<string> missing = new List<string>();
         for (int i = 0; i < names.Length; i++)
@@ -401,6 +415,153 @@ internal static class OuterAIUpdater
     }
 }
 
+// ============================== Terms of Service ==============================
+// Pops up the first time Outer AI is imported into a project, and again whenever the TOS version changes
+// (TosVersion in OuterAI.cs, or "tosVersion" in version.json on GitHub). Saved per project.
+internal static class OuterAITos
+{
+    internal const string Url = "https://sites.google.com/view/outerhorrorai/home/tos";
+    internal const string Key = "OuterAI.TosAccepted";
+    internal static string Pending = "";
+
+    internal static string LocalVersion()
+    {
+        FieldInfo f = typeof(OuterAI).GetField("TosVersion", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        if (f == null) return "1";
+        object v = f.IsLiteral ? f.GetRawConstantValue() : f.GetValue(null);
+        return v as string ?? "1";
+    }
+
+    // True while the TOS has not been agreed to. Everything in Outer AI stays locked while this is true.
+    internal static bool Blocked { get { return !string.IsNullOrEmpty(Pending) || NeedsAccept(LocalVersion()); } }
+
+    internal static void Prompt() { Require(string.IsNullOrEmpty(Pending) ? LocalVersion() : Pending); }
+
+    // Use at the top of any action: returns true (and shows the agree window) if the action must stop.
+    internal static bool Guard()
+    {
+        if (!Blocked) return false;
+        Prompt();
+        return true;
+    }
+
+    internal static void DrawBlocked()
+    {
+        EditorGUILayout.HelpBox("Outer AI is locked until you agree to the Terms of Service.", MessageType.Warning);
+        if (GUILayout.Button("Open Terms Of Service Agreement", GUILayout.Height(28f))) Prompt();
+    }
+
+    internal static string Accepted() { return EditorUserSettings.GetConfigValue(Key) ?? ""; }
+
+    internal static bool NeedsAccept(string required)
+    {
+        return !string.IsNullOrEmpty(required) && OuterAIUpdater.IsNewer(required, Accepted());
+    }
+
+    // GitHub check: ANY different value (higher or lower) from what this project accepted pops it up.
+    internal static bool NeedsAcceptRemote(string remote)
+    {
+        return !string.IsNullOrEmpty(remote) && remote.Trim() != Accepted();
+    }
+
+    internal static void Require(string version)
+    {
+        Pending = version.Trim();
+        OuterAITosWindow.Open();
+    }
+
+    internal static void Accept()
+    {
+        if (!string.IsNullOrEmpty(Pending)) EditorUserSettings.SetConfigValue(Key, Pending);
+        Pending = "";
+        InternalEditorUtility.RepaintAllViews();
+        EditorApplication.RepaintHierarchyWindow();
+        SceneView.RepaintAll();
+    }
+
+    [MenuItem("Outer AI/Terms of Service", false, 61)]
+    private static void MenuOpen() { if (!Guard()) Application.OpenURL(Url); }
+}
+
+// Stops Play mode in the editor (for scenes that use Outer AI) until the TOS is agreed to.
+[InitializeOnLoad]
+internal static class OuterAIPlayGuard
+{
+    static OuterAIPlayGuard() { EditorApplication.playModeStateChanged += OnState; }
+
+    private static void OnState(PlayModeStateChange s)
+    {
+        if (s != PlayModeStateChange.ExitingEditMode || !OuterAITos.Blocked) return;
+        if (Object.FindObjectsByType<OuterAI>(FindObjectsInactive.Include, FindObjectsSortMode.None).Length == 0) return;
+        EditorApplication.isPlaying = false;
+        Debug.LogWarning("Outer AI: Play mode was stopped. Agree to the Terms of Service first (Outer AI > Terms of Service).");
+        EditorApplication.delayCall += OuterAITos.Prompt;
+    }
+}
+
+public class OuterAITosWindow : EditorWindow
+{
+    private GUIStyle body, note;
+    private bool updated;
+
+    internal static void Open()
+    {
+        OuterAITosWindow w = GetWindow<OuterAITosWindow>(true, "Outer AI Terms of Service", true);
+        w.minSize = w.maxSize = new Vector2(460f, 250f);
+        Rect m = EditorGUIUtility.GetMainWindowPosition();
+        w.position = new Rect(m.x + (m.width - 460f) * 0.5f, m.y + (m.height - 250f) * 0.5f, 460f, 250f);
+        w.updated = !string.IsNullOrEmpty(OuterAITos.Accepted());
+        w.ShowUtility();
+        w.Focus();
+    }
+
+    private void OnGUI()
+    {
+        if (body == null)
+        {
+            body = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontSize = 14, fontStyle = FontStyle.Bold, wordWrap = true };
+            body.normal.textColor = Color.white;
+            note = new GUIStyle(body) { fontSize = 11, fontStyle = FontStyle.Italic };
+            note.normal.textColor = new Color(0.86f, 0.86f, 0.88f);
+        }
+        OuterAIThemedEditor.ThemeData t = OuterAIThemedEditor.CurrentTheme;
+        Rect full = new Rect(0f, 0f, position.width, position.height);
+        Color accent = t.logo; accent.a = 1f;
+        if (Event.current.type == EventType.Repaint)
+        {
+            OuterAIUpdateLogWindow.DrawBackground(full, t);
+            Rect frame = new Rect(10f, 10f, full.width - 20f, full.height - 20f);
+            GUI.DrawTexture(frame, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(0f, 0f, 0f, 0.58f), 0f, 16f);
+            GUI.DrawTexture(frame, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, accent, 2f, 16f);
+        }
+
+        GUILayout.BeginArea(new Rect(26f, 22f, full.width - 52f, full.height - 44f));
+        Rect tr = GUILayoutUtility.GetRect(0f, 40f, GUILayout.ExpandWidth(true));
+        if (Event.current.type == EventType.Repaint) OuterAIThemedEditor.DrawLogoText(tr, "TERMS OF SERVICE", 24);
+        GUILayout.Space(8f);
+        GUILayout.Label("By clicking agree, you agree to the TOS.", body);
+        GUILayout.Label("Outer AI stays locked until you agree.", note);
+        if (updated) GUILayout.Label("The Terms of Service were updated.", note);
+        GUILayout.Space(6f);
+
+        Color old = GUI.backgroundColor;
+        GUI.backgroundColor = Color.Lerp(t.tabOn, Color.white, 0.15f);
+        if (GUILayout.Button("Read the TOS", GUILayout.Height(26f))) Application.OpenURL(OuterAITos.Url);
+        GUILayout.FlexibleSpace();
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("Agree", GUILayout.Height(30f)))
+        {
+            OuterAITos.Accept();
+            EditorApplication.delayCall += OuterAIUpdateCheck.ShowLogIfNew;
+            Close();
+        }
+        if (GUILayout.Button("Decline", GUILayout.Height(30f))) Close();
+        EditorGUILayout.EndHorizontal();
+        GUI.backgroundColor = old;
+        GUILayout.EndArea();
+    }
+}
+
 // ============================== the screen ==============================
 public class OuterAIUpdateLogWindow : EditorWindow
 {
@@ -412,6 +573,7 @@ public class OuterAIUpdateLogWindow : EditorWindow
     [MenuItem("Outer AI/Update Log", false, 60)]
     public static void Open()
     {
+        if (OuterAITos.Guard()) return;
         OuterAIUpdateLogWindow w = GetWindow<OuterAIUpdateLogWindow>(true, "Outer AI Update Log", true);
         w.minSize = new Vector2(480f, 560f);
         Rect m = EditorGUIUtility.GetMainWindowPosition();
@@ -438,7 +600,7 @@ public class OuterAIUpdateLogWindow : EditorWindow
         bannerOutline = new GUIStyle(bannerFill);
     }
 
-    private static void DrawBackground(Rect full, OuterAIThemedEditor.ThemeData t)
+    internal static void DrawBackground(Rect full, OuterAIThemedEditor.ThemeData t)
     {
         if (t.bgMode == 1)
         {
