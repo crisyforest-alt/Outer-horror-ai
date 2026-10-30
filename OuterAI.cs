@@ -13,7 +13,7 @@ using Photon.Voice.Unity;
 public class OuterAI : MonoBehaviourPunCallbacks, IPunObservable
 {
 // UPDATE LOG VERSION: change this text whenever you release an update. When someone imports the new script and this no longer matches what their project last saw, the Update Log screen opens once.
-public const string UpdateLogVersion = "1.3";
+public const string UpdateLogVersion = "1.4";
 // TOS VERSION: change this text whenever the Terms of Service change. Everyone who imports it (or already has Outer AI) sees the "By clicking agree, you agree to the TOS." pop up once for the new version.
 public const string TosVersion = "1";
 [HideInInspector] public int ActiveInspectorTab = 0;
