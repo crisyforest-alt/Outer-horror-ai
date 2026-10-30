@@ -701,6 +701,65 @@ internal static class OuterAIUser
     }
 
     // Starts the ban check. Outer AI stays locked until it ends. Offline or error = unlock (a saved ban still applies).
+    // ---- developer access: the codes in devs.txt (edited from the Dev window) get dev access ----
+    private const string DevKey = "OuterAI.DevAccess";
+    private static int devCache = -1;
+    private static UnityWebRequest devReq;
+    private static System.Action devDone;
+
+    internal static bool DevAccess
+    {
+        get
+        {
+            if (devCache < 0) devCache = EditorPrefs.GetBool(DevKey, false) ? 1 : 0;
+            return devCache == 1;
+        }
+    }
+
+    // Reads devs.txt and keeps this computer's dev access in step with it. Offline or errors change nothing.
+    internal static void CheckDevList(System.Action done)
+    {
+        if (devReq != null) { devDone += done; return; }
+        devDone = done;
+        devReq = UnityWebRequest.Get(OuterAIUpdater.BaseUrl + "devs.txt?t=" + System.DateTime.UtcNow.Ticks);
+        devReq.timeout = 10;
+        devReq.SetRequestHeader("Cache-Control", "no-cache");
+        devReq.SendWebRequest();
+        EditorApplication.update += PollDev;
+    }
+
+    private static void PollDev()
+    {
+        if (devReq == null) { EditorApplication.update -= PollDev; return; }
+        if (!devReq.isDone) return;
+        EditorApplication.update -= PollDev;
+        UnityWebRequest r = devReq;
+        devReq = null;
+        System.Action cb = devDone;
+        devDone = null;
+        try
+        {
+            bool known = false, ok = false;
+            if (r.result == UnityWebRequest.Result.Success)
+            {
+                known = true;
+                string code = ExistingCode();
+                if (code.Length > 0)
+                    foreach (string c in ParseCodes(r.downloadHandler.text))
+                        if (string.Equals(c, code, System.StringComparison.OrdinalIgnoreCase)) ok = true;
+            }
+            else if (r.responseCode == 404) known = true; // no devs.txt yet = nobody has dev access
+            if (known && ok != DevAccess)
+            {
+                devCache = ok ? 1 : 0;
+                EditorPrefs.SetBool(DevKey, ok);
+                InternalEditorUtility.RepaintAllViews();
+            }
+        }
+        finally { r.Dispose(); }
+        if (cb != null) cb();
+    }
+
     internal static void VerifyNow()
     {
         if (banReq != null) return;
@@ -712,6 +771,7 @@ internal static class OuterAIUser
         banReq.SetRequestHeader("Cache-Control", "no-cache");
         banReq.SendWebRequest();
         EditorApplication.update += PollBan;
+        CheckDevList(null);
     }
 
     private static void PollBan()
@@ -856,9 +916,10 @@ internal static class OuterAICopy
     private const string OldTypeName = "OuterAICopyId"; // the earlier build used this name
     private static readonly Regex Mark = new Regex("CopyMark\\s*=\\s*\"([A-Z0-9]{5,12})\"");
 
-    // The developer's project (it has the Dev window) never gets an ID, or the GitHub upload would carry it.
+    // The developer's project (it has the Dev window, unlocked with a GitHub token that can write to the repo) never gets an ID, or the GitHub upload would carry it.
     internal static bool DevMachine()
     {
+        if (!EditorPrefs.GetBool("OuterAI.DevVerified", false)) return false; // the Dev window must be unlocked with a repo-write GitHub token
         foreach (Assembly a in System.AppDomain.CurrentDomain.GetAssemblies())
         {
             try { if (a.GetType("OuterAIDevWindow") != null) return true; } catch { }
@@ -1511,7 +1572,7 @@ public class OuterAIUpdateLogWindow : EditorWindow
         bool button = false;
         if (s == OuterAIUpdater.State.Available)
         {
-            text = "UPDATE AVAILABLE: version " + OuterAIUpdater.remoteVersion + (string.IsNullOrEmpty(OuterAIUpdater.remoteNotes) ? "" : "\n" + OuterAIUpdater.remoteNotes);
+            text = (OuterAIUser.DevAccess ? "DEVELOPER VERSION AVAILABLE: version " : "UPDATE AVAILABLE: version ") + OuterAIUpdater.remoteVersion + (string.IsNullOrEmpty(OuterAIUpdater.remoteNotes) ? "" : "\n" + OuterAIUpdater.remoteNotes);
             button = true;
         }
         else if (s != OuterAIUpdater.State.Idle && !string.IsNullOrEmpty(OuterAIUpdater.message)) text = OuterAIUpdater.message;
@@ -1532,7 +1593,7 @@ public class OuterAIUpdateLogWindow : EditorWindow
         if (button)
         {
             GUI.enabled = OuterAIUpdater.state == OuterAIUpdater.State.Available;
-            if (GUI.Button(new Rect(r.x + 10f, r.yMax - 34f, r.width - 20f, 26f), "Update Now"))
+            if (GUI.Button(new Rect(r.x + 10f, r.yMax - 34f, r.width - 20f, 26f), OuterAIUser.DevAccess ? "Get Developer Version" : "Update Now"))
                 EditorApplication.delayCall += OuterAIUpdater.StartUpdate;
             GUI.enabled = true;
         }
