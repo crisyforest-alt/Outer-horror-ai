@@ -1,13 +1,13 @@
 {
-  "version": "1.3",
+  "version": "1.4",
   "tosVersion": "1",
-  "notes": "Adds the TOS agreement pop up",
+  "notes": "This was a test uploaded from the outer ai dev window. If you are seeing this, it has worked and verify it has worked in beta channel ",
   "files": [
-    { "name": "OuterAI.cs" },
-    { "name": "OuterAIManager.cs" },
-    { "name": "OuterAIUpdateLog.cs" },
-    { "name": "LocalPlayerTeleport.cs" },
-    { "name": "PlayerDeathHandler.cs" },
-    { "name": "SkinSlotMap.cs" }
+    { "name": "OuterAI.cs", "sha256": "f01e1c2f1feea092fafdfca58dd9de285c48632cc3c220bcbb8f77cb6144b15b" },
+    { "name": "OuterAIManager.cs", "sha256": "e689568b8911d363fbbfd52fa0b1a36af33711745e33cdd8ca3f179bc4343e9b" },
+    { "name": "OuterAIUpdateLog.cs", "sha256": "fd07c69d847ffd2ada8d926eaa9bc9b28689485d80ba16d8296ca3dd6e375823" },
+    { "name": "LocalPlayerTeleport.cs", "sha256": "681b7084b53392cd9bf7b3edfdbad9937d949b96d56ef90d670c565276db427d" },
+    { "name": "PlayerDeathHandler.cs", "sha256": "146b8078bb928ad4c560cf66ace2d56ac106e37cab955084b8e94b7b395465d4" },
+    { "name": "SkinSlotMap.cs", "sha256": "be56070804bf886afc5a409cd6e20ae956bbdaf28e594bd6ec8f2021f35f8c31" }
   ]
 }
