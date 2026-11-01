@@ -33,7 +33,9 @@ internal static class OuterAIUpdateData
     internal struct Block
     {
         public string Head, Body; // Body == null means this is a group header like ADDITIONS
-        public Block(string head, string body) { Head = head; Body = body; }
+        public string Gif;        // optional: file name of an animated GIF shown under the text, e.g. "new-manager.gif"
+        public Block(string head, string body) { Head = head; Body = body; Gif = null; }
+        public Block(string head, string body, string gif) { Head = head; Body = body; Gif = gif; }
     }
 
     internal static readonly Block[] Blocks =
@@ -61,6 +63,84 @@ internal static class OuterAIUpdateData
         new Block("NEW UPDATE LOG",
             "This screen. It opens once whenever a new version of Outer AI is imported. You can open it any time from Outer AI > Update Log."),
     };
+}
+
+// ============================== GIFs for the update log ==============================
+// A block can show a GIF:  new Block("HEAD", "text", "my-update.gif")
+// Put the GIF in the "UpdateGifs" folder of the GitHub repo (next to version.json). It is downloaded once when the Update Log is
+// opened and kept in Library/OuterAIGifs. While testing you can also drop the GIF anywhere in Assets and it is used from there.
+// If you change a GIF, give it a new file name so people do not keep the old cached one.
+internal static class OuterAIGifCache
+{
+    private class Item { public byte[] data; public bool failed; public UnityWebRequest req; }
+    private static readonly Dictionary<string, Item> items = new Dictionary<string, Item>();
+    private static bool polling;
+    private const int MaxBytes = 10 * 1024 * 1024;
+    private static string Root { get { return Directory.GetParent(Application.dataPath).FullName; } }
+    private static string Dir { get { return Path.Combine(Path.Combine(Root, "Library"), "OuterAIGifs"); } }
+
+    // The current frame, or null (with a status text) while it loads or if it failed.
+    internal static Texture Get(string name, out string status)
+    {
+        status = null;
+        if (string.IsNullOrEmpty(name) || !Regex.IsMatch(name, @"^[A-Za-z0-9_\-]+\.gif$")) { status = "This update has a bad GIF name."; return null; }
+        Item it;
+        if (!items.TryGetValue(name, out it)) { it = new Item(); items[name] = it; Begin(name, it); }
+        if (it.failed) { status = "The animation could not be loaded."; return null; }
+        if (it.data == null) { status = "Loading animation..."; return null; }
+        Texture t = OuterAIAnimBg.GetData("updategif:" + name, it.data);
+        if (t == null) status = "The animation could not be read.";
+        return t;
+    }
+
+    private static bool LooksLikeGif(byte[] d) { return d != null && d.Length > 16 && d.Length <= MaxBytes && d[0] == 'G' && d[1] == 'I' && d[2] == 'F' && d[3] == '8'; }
+
+    private static void Begin(string name, Item it)
+    {
+        try
+        {
+            foreach (string g in AssetDatabase.FindAssets(Path.GetFileNameWithoutExtension(name)))   // 1) a copy inside the project
+            {
+                string p = AssetDatabase.GUIDToAssetPath(g);
+                if (p.StartsWith("Assets/") && Path.GetFileName(p).Equals(name, System.StringComparison.OrdinalIgnoreCase))
+                {
+                    byte[] d = File.ReadAllBytes(Path.Combine(Root, p));
+                    if (LooksLikeGif(d)) { it.data = d; return; }
+                }
+            }
+            string cache = Path.Combine(Dir, name);                                                    // 2) already downloaded
+            if (File.Exists(cache))
+            {
+                byte[] d = File.ReadAllBytes(cache);
+                if (LooksLikeGif(d)) { it.data = d; return; }
+            }
+        }
+        catch (System.Exception) { }
+        if (Application.isBatchMode) { it.failed = true; return; }
+        it.req = UnityWebRequest.Get(OuterAIUpdater.BaseUrl + "UpdateGifs/" + name + "?t=" + System.DateTime.UtcNow.Ticks);   // 3) GitHub
+        it.req.timeout = 20;
+        it.req.SendWebRequest();
+        if (!polling) { polling = true; EditorApplication.update += Poll; }
+    }
+
+    private static void Poll()
+    {
+        bool any = false, finished = false;
+        foreach (KeyValuePair<string, Item> kv in items)
+        {
+            Item it = kv.Value;
+            if (it.req == null) continue;
+            if (!it.req.isDone) { any = true; continue; }
+            byte[] d = it.req.result == UnityWebRequest.Result.Success ? it.req.downloadHandler.data : null;
+            it.req.Dispose(); it.req = null;
+            finished = true;
+            if (!LooksLikeGif(d)) { it.failed = true; continue; }
+            it.data = d;
+            try { Directory.CreateDirectory(Dir); File.WriteAllBytes(Path.Combine(Dir, kv.Key), d); } catch (System.Exception) { }
+        }
+        if (!any) { EditorApplication.update -= Poll; polling = false; }
+        if (finished && OuterAIUpdater.Changed != null) OuterAIUpdater.Changed();   // repaint the window
+    }
 }
 
 // ============================== the check that runs in the background ==============================
@@ -119,7 +199,7 @@ internal static class OuterAIUpdateCheck
 
 // ============================== the GitHub updater ==============================
 [System.Serializable] internal class OuterAIManifestFile { public string name; public string sha256; }
-[System.Serializable] internal class OuterAIManifest { public string version; public string tosVersion; public string notes; public OuterAIManifestFile[] files; }
+[System.Serializable] internal class OuterAIManifest { public string version; public string tosVersion; public string notes; public string minVersion; public OuterAIManifestFile[] files; }
 
 internal static class OuterAIUpdater
 {
@@ -137,6 +217,11 @@ internal static class OuterAIUpdater
     internal static string message = "";
     internal static string remoteVersion = "";
     internal static string remoteNotes = "";
+
+    // ---- FORCE UPDATE: anyone this many updates behind (or below "minVersion" in version.json) is updated automatically ----
+    internal const int ForceBehind = 2;
+    internal static bool forced;      // the update that is waiting / running is required
+    internal static int behind;       // how many updates behind this copy is
     internal static System.Action Changed;
 
     private const string PromptKey = "OuterAI.UpdatePrompted";
@@ -162,6 +247,27 @@ internal static class OuterAIUpdater
         return remote != local;
     }
     private static string Pad(string v) { return v.Contains(".") ? v : v + ".0"; }
+
+    // How many updates behind: every step of the minor number is one update (1.3 -> 1.5 = 2). A new major version counts as far behind.
+    internal static int UpdatesBehind(string remote, string local)
+    {
+        if (string.IsNullOrEmpty(remote) || string.IsNullOrEmpty(local)) return 0;
+        System.Version a, b;
+        if (!System.Version.TryParse(Pad(remote), out a) || !System.Version.TryParse(Pad(local), out b) || a <= b) return 0;
+        if (a.Major > b.Major) return 99;
+        if (a.Minor > b.Minor) return a.Minor - b.Minor;
+        return Mathf.Max(1, Mathf.Max(0, a.Build) - Mathf.Max(0, b.Build));
+    }
+
+    // Developers (dev access) are never forced: they pick their own version. Everyone else is forced when 2+ updates behind,
+    // or when version.json on GitHub has a "minVersion" that is newer than theirs.
+    private static bool ShouldForce(OuterAIManifest m, string local)
+    {
+        if (OuterAIUser.DevAccess) return false;
+        if (UpdatesBehind(m.version, local) >= ForceBehind) return true;
+        return !string.IsNullOrEmpty(m.minVersion) && IsNewer(m.minVersion, local);
+    }
+    private static void StartForced() { StartUpdate(true); }
 
     private static string Sha256(byte[] data)
     {
@@ -214,25 +320,43 @@ internal static class OuterAIUpdater
             {
                 state = State.Available;
                 message = "";
+                behind = UpdatesBehind(m.version, local);
+                forced = ShouldForce(m, local);
+                if (forced)
+                {
+                    // Too far behind: open the Update Log (so they see why) and start the update by itself.
+                    if (!EditorWindow.HasOpenInstances<OuterAIUpdateLogWindow>() && !Application.isBatchMode) OuterAIUpdateLogWindow.Open();
+                    EditorApplication.delayCall += StartForced;
+                }
                 if (silent && EditorUserSettings.GetConfigValue(PromptKey) != m.version)
                 {
                     EditorUserSettings.SetConfigValue(PromptKey, m.version); // only pop up once per new version
                     if (!EditorWindow.HasOpenInstances<OuterAIUpdateLogWindow>()) OuterAIUpdateLogWindow.Open();
                 }
             }
-            else { state = State.UpToDate; message = "You have the newest version (" + local + ")."; }
+            else { forced = false; behind = 0; state = State.UpToDate; message = "You have the newest version (" + local + ")."; }
         }
         finally { r.Dispose(); Notify(); }
     }
 
     // ------------------------------------------------------------ 2) download everything, THEN replace
-    internal static void StartUpdate()
+    internal static void StartUpdate() { StartUpdate(false); }
+
+    // force = a required update: the same steps (download everything first, back up, replace) but they cannot cancel it.
+    internal static void StartUpdate(bool force)
     {
         if (state != State.Available || manifest == null) return;
-        if (OuterAITos.Guard()) return;
+        if (OuterAITos.Guard()) return;     // TOS first; a required update is picked up again on the next check
         StringBuilder list = new StringBuilder();
         foreach (OuterAIManifestFile f in manifest.files) list.Append("  - ").Append(f.name).Append('\n');
-        if (!EditorUtility.DisplayDialog("Update Outer AI to " + manifest.version + "?",
+        if (force)
+        {
+            if (!Application.isBatchMode)
+                EditorUtility.DisplayDialog("Required update: Outer AI " + manifest.version,
+                    "This copy of Outer AI is " + (behind >= 99 ? "a whole version" : behind + " updates") + " behind, so it has to update.\n\nThese scripts will be replaced:\n" + list +
+                    "\nYour current scripts are backed up first. If something goes wrong you can use Outer AI > Restore Previous Version.", "Update");
+        }
+        else if (!EditorUtility.DisplayDialog("Update Outer AI to " + manifest.version + "?",
             "These scripts will be replaced:\n" + list +
             "\nYour current scripts are backed up first. If something goes wrong you can press 'Restore Previous Version' on the Update Log screen.",
             "Update", "Cancel")) return;
@@ -1528,8 +1652,8 @@ public class OuterAIUpdateLogWindow : EditorWindow
         w.Focus();
     }
 
-    private void OnEnable() { OuterAIUpdater.Changed += Repaint; }
-    private void OnDisable() { OuterAIUpdater.Changed -= Repaint; }
+    private void OnEnable() { OuterAIUpdater.Changed += Repaint; OuterAIAnimBg.OnFrame += Repaint; }
+    private void OnDisable() { OuterAIUpdater.Changed -= Repaint; OuterAIAnimBg.OnFrame -= Repaint; }
 
     private void BuildStyles()
     {
@@ -1564,13 +1688,40 @@ public class OuterAIUpdateLogWindow : EditorWindow
         GUI.DrawTexture(full, grad, ScaleMode.StretchToFill);
     }
 
+    // An animated GIF under a block (small, rounded, with a thin accent border).
+    private void DrawGif(string gifName, float width, Color accent)
+    {
+        string status;
+        Texture tex = OuterAIGifCache.Get(gifName, out status);
+        GUILayout.Space(6f);
+        if (tex == null) { if (status != null) GUILayout.Label(status, date); return; }
+        float aspect = Mathf.Max(0.1f, (float)tex.width / Mathf.Max(1, tex.height));
+        float w = Mathf.Min(width - 20f, 380f), h = w / aspect;
+        if (h > 240f) { h = 240f; w = h * aspect; }
+        Rect r = GUILayoutUtility.GetRect(0f, h + 6f, GUILayout.ExpandWidth(true));
+        if (Event.current.type != EventType.Repaint) return;
+        Rect g = new Rect(r.center.x - w * 0.5f, r.y + 3f, w, h);
+        GUI.DrawTexture(g, tex, ScaleMode.StretchToFill, true, 0f, Color.white, 0f, 8f);
+        GUI.DrawTexture(g, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, accent, 1f, 8f);
+    }
+
     // The box under the date that talks about updates (checking, available, downloading, done, error).
     private void DrawUpdateBox(float width, Color accent)
     {
         OuterAIUpdater.State s = OuterAIUpdater.state;
         string text = null;
-        bool button = false;
-        if (s == OuterAIUpdater.State.Available)
+        bool button = false, retry = false;
+        if (s == OuterAIUpdater.State.Available && OuterAIUpdater.forced)
+        {
+            text = "REQUIRED UPDATE: you are " + (OuterAIUpdater.behind >= 99 ? "a whole version" : OuterAIUpdater.behind + " updates") + " behind (version " + OuterAIUpdater.remoteVersion + " is out). Outer AI is updating itself now."
+                 + (string.IsNullOrEmpty(OuterAIUpdater.remoteNotes) ? "" : "\n" + OuterAIUpdater.remoteNotes);
+        }
+        else if (s == OuterAIUpdater.State.Error && OuterAIUpdater.forced)
+        {
+            text = OuterAIUpdater.message + "\nThis update is required. It tries again every time Unity opens, or press Try Again.";
+            retry = true;
+        }
+        else if (s == OuterAIUpdater.State.Available)
         {
             text = (OuterAIUser.DevAccess ? "DEVELOPER VERSION AVAILABLE: version " : "UPDATE AVAILABLE: version ") + OuterAIUpdater.remoteVersion + (string.IsNullOrEmpty(OuterAIUpdater.remoteNotes) ? "" : "\n" + OuterAIUpdater.remoteNotes);
             button = true;
@@ -1579,7 +1730,7 @@ public class OuterAIUpdateLogWindow : EditorWindow
         if (text == null) return;
 
         float th = body.CalcHeight(new GUIContent(text), width - 20f);
-        float h = th + 14f + (button ? 38f : 0f);
+        float h = th + 14f + (button || retry ? 38f : 0f);
         Rect r = GUILayoutUtility.GetRect(0f, h, GUILayout.ExpandWidth(true));
         if (Event.current.type == EventType.Repaint)
         {
@@ -1590,6 +1741,11 @@ public class OuterAIUpdateLogWindow : EditorWindow
         GUIStyle ts = new GUIStyle(body) { alignment = TextAnchor.MiddleCenter };
         ts.normal.textColor = Color.white;
         GUI.Label(new Rect(r.x + 10f, r.y + 7f, r.width - 20f, th), text, ts);
+        if (retry)
+        {
+            if (GUI.Button(new Rect(r.x + 10f, r.yMax - 34f, r.width - 20f, 26f), "Try Again"))
+                EditorApplication.delayCall += () => OuterAIUpdater.Check(false);
+        }
         if (button)
         {
             GUI.enabled = OuterAIUpdater.state == OuterAIUpdater.State.Available;
@@ -1662,6 +1818,7 @@ public class OuterAIUpdateLogWindow : EditorWindow
                 GUILayout.Space(14f);
                 GUILayout.Label(b.Head, head);
                 GUILayout.Label(b.Body, body);
+                if (!string.IsNullOrEmpty(b.Gif)) DrawGif(b.Gif, areaW, accent);
             }
         }
         GUILayout.Space(10f);
