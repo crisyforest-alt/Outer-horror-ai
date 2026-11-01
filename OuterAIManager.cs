@@ -533,6 +533,490 @@ internal static class OuterAIManagerTools
     "Press 'Check Only'. It never changes anything, it just tells you what is wrong.";
 }
 
+// Checks the date once a minute so holiday themes can switch on/off by themselves.
+[InitializeOnLoad]
+internal static class OuterAIHolidayWatcher
+{
+    private static double next;
+    static OuterAIHolidayWatcher() { EditorApplication.update += Tick; }
+    private static void Tick()
+    {
+        double n = EditorApplication.timeSinceStartup;
+        if (n < next) return;
+        next = n + 60.0;
+        OuterAIThemedEditor.HolidayTick();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ANIMATED BACKGROUNDS (GIF + video). Everything is kept SMALL (max ~192 px) and only lives while an Outer AI
+// window/inspector is open and drawing it. A few seconds after nothing draws it, it is freed from memory.
+// ---------------------------------------------------------------------------------------------
+internal static class OuterAIAnimBg
+{
+    private const int MaxDim = 320;       // longest side of every frame / video texture
+    private const long MaxFrameBytes = 64L * 1024 * 1024;   // memory budget for all GIF frames; only GIFs over it lose frames
+    private const long MaxGifBytes = 20L * 1024 * 1024;
+    private const double IdleSeconds = 3.0;
+
+    public static bool Active { get { return clips.Count > 0; } }
+    public static System.Action OnFrame;  // inspectors/windows subscribe so they only repaint while open
+
+    private class Clip
+    {
+        public string guid, error;
+        public bool isVideo;
+        public List<Texture2D> frames = new List<Texture2D>();
+        public List<float> delays = new List<float>();
+        public float total;
+        public int idx;
+        public double t0, lastUsed;
+        public Texture frame;
+        public bool live;
+        public double liveSeen;
+        public GameObject go;
+        public UnityEngine.Video.VideoPlayer vp;
+        public RenderTexture rt;
+    }
+    private static readonly Dictionary<string, Clip> clips = new Dictionary<string, Clip>();
+    private static bool hooked;
+    private static double lastRepaint;
+
+    // ---- live look: follows what the animation is showing right now ----
+    public static Texture2D BlurTex;                 // tiny copy of the current frame (smooth when stretched = fake blur)
+    public static float LiveLum = 0.3f;              // smoothed brightness of the background (0 dark .. 1 light)
+    public static Color LiveVivid = Color.gray;      // smoothed most colorful color of the background
+    public static int LiveStamp;                     // goes up whenever the live look changed enough to rebuild colors
+    public static bool LiveReady;
+    private static Color liveTint = Color.white, tgtViv = Color.gray, stampViv = Color.gray;
+    private static float liveDim, tgtLum = 0.3f, stampLum = -1f;
+    private static double lastAnalyze, lastTick;
+    private static bool liveInit;
+    private static Texture2D liveTmp;
+    private const int LN = 20;
+    public static float BlurAspect = 1f;             // width / height of the blurred picture (same as the frame, so it is never squished)
+    private static Texture2D blurTmp;
+
+    private static void Analyze(Clip c)
+    {
+        try
+        {
+            if (liveTmp == null) liveTmp = new Texture2D(LN, LN, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave };
+            RenderTexture rt = RenderTexture.GetTemporary(LN, LN, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+            RenderTexture prev = RenderTexture.active;
+            Graphics.Blit(c.frame, rt);
+            RenderTexture.active = rt;
+            liveTmp.ReadPixels(new Rect(0, 0, LN, LN), 0, 0);
+            RenderTexture.active = prev;
+            RenderTexture.ReleaseTemporary(rt);
+            Color[] px = liveTmp.GetPixels();
+            Color sum = Color.black, vsum = Color.black; float vw = 0f, n = 0f;
+            for (int i = 0; i < px.Length; i++)
+            {
+                Color p = px[i];
+                if (p.a >= 0.1f)
+                {
+                    sum += p; n += 1f;
+                    float h, sat, v; Color.RGBToHSV(p, out h, out sat, out v);
+                    float w = sat * sat * v + 0.0001f;
+                    vsum += p * w; vw += w;
+                }
+                p.a = 1f; px[i] = p;
+            }
+            if (n < 1f) return;
+            Color avg = sum / n; avg.a = 1f;
+            Color eff = Color.Lerp(avg * liveTint, Color.black, Mathf.Clamp01(liveDim));
+            tgtLum = 0.2126f * eff.r + 0.7152f * eff.g + 0.0722f * eff.b;
+            Color viv = vw > 0f ? vsum / vw : avg; viv.a = 1f;
+            tgtViv = viv * liveTint; tgtViv.a = 1f;
+            BuildBlur(c.frame);
+            if (!liveInit) { liveInit = true; LiveLum = tgtLum; LiveVivid = tgtViv; LiveReady = true; stampLum = -1f; }
+        }
+        catch (System.Exception) { }
+    }
+    // Real blur: shrink the frame to ~64 px (keeping its shape), then blur it with 3 box-blur passes (= gaussian).
+    private static void BuildBlur(Texture frame)
+    {
+        float aspect = Mathf.Max(0.1f, (float)frame.width / Mathf.Max(1, frame.height));
+        int bw = aspect >= 1f ? 64 : Mathf.Max(16, Mathf.RoundToInt(64f * aspect));
+        int bh = aspect >= 1f ? Mathf.Max(16, Mathf.RoundToInt(64f / aspect)) : 64;
+        if (BlurTex == null || BlurTex.width != bw || BlurTex.height != bh)
+        {
+            if (BlurTex != null) Object.DestroyImmediate(BlurTex);
+            if (blurTmp != null) Object.DestroyImmediate(blurTmp);
+            BlurTex = new Texture2D(bw, bh, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave, wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear };
+            blurTmp = new Texture2D(bw, bh, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave };
+        }
+        BlurAspect = aspect;
+        RenderTexture rt = RenderTexture.GetTemporary(bw, bh, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        RenderTexture prev = RenderTexture.active;
+        Graphics.Blit(frame, rt);
+        RenderTexture.active = rt;
+        blurTmp.ReadPixels(new Rect(0, 0, bw, bh), 0, 0);
+        RenderTexture.active = prev;
+        RenderTexture.ReleaseTemporary(rt);
+        Color[] a = blurTmp.GetPixels();
+        Color[] b = new Color[a.Length];
+        for (int pass = 0; pass < 3; pass++)
+        {
+            BoxPass(a, b, bw, bh, 4, true);
+            BoxPass(b, a, bw, bh, 4, false);
+        }
+        for (int i = 0; i < a.Length; i++) a[i].a = 1f;
+        BlurTex.SetPixels(a);
+        BlurTex.Apply(false);
+    }
+    private static void BoxPass(Color[] src, Color[] dst, int w, int h, int rad, bool horizontal)
+    {
+        int lines = horizontal ? h : w, len = horizontal ? w : h;
+        float inv = 1f / (rad * 2 + 1);
+        for (int l = 0; l < lines; l++)
+        {
+            Color sum = Color.black;
+            for (int i = -rad; i <= rad; i++)
+            {
+                int ci = Mathf.Clamp(i, 0, len - 1);
+                sum += horizontal ? src[l * w + ci] : src[ci * w + l];
+            }
+            for (int i = 0; i < len; i++)
+            {
+                Color o = sum * inv;
+                if (horizontal) dst[l * w + i] = o; else dst[i * w + l] = o;
+                int add = Mathf.Clamp(i + rad + 1, 0, len - 1), rem = Mathf.Clamp(i - rad, 0, len - 1);
+                sum += horizontal ? src[l * w + add] - src[l * w + rem] : src[add * w + l] - src[rem * w + l];
+            }
+        }
+    }
+    private static void ResetLive()
+    {
+        if (blurTmp != null) { Object.DestroyImmediate(blurTmp); blurTmp = null; }
+        LiveReady = false; liveInit = false; stampLum = -1f;
+        if (BlurTex != null) { Object.DestroyImmediate(BlurTex); BlurTex = null; }
+        if (liveTmp != null) { Object.DestroyImmediate(liveTmp); liveTmp = null; }
+    }
+
+    public static bool IsValidAsset(Object o)
+    {
+        if (o == null) return false;
+        if (o is UnityEngine.Video.VideoClip) return true;
+        string path = AssetDatabase.GetAssetPath(o);
+        return !string.IsNullOrEmpty(path) && path.EndsWith(".gif", System.StringComparison.OrdinalIgnoreCase);
+    }
+    public static string Error(string guid) { Clip c; return !string.IsNullOrEmpty(guid) && clips.TryGetValue(guid, out c) ? c.error : null; }
+
+    // Current frame (null while a video is still preparing or if it failed). Call it from Repaint.
+    public static Texture Get(string guid, bool live = false, Color tint = default(Color), float dim = 0f)
+    {
+        if (string.IsNullOrEmpty(guid)) return null;
+        Clip c;
+        if (!clips.TryGetValue(guid, out c))
+        {
+            c = new Clip { guid = guid, t0 = EditorApplication.timeSinceStartup };
+            clips[guid] = c;
+            try { Load(c); } catch (System.Exception e) { c.error = e.Message; }
+            if (!hooked) { hooked = true; EditorApplication.update += Tick; }
+        }
+        c.lastUsed = EditorApplication.timeSinceStartup;
+        if (live) { c.live = true; c.liveSeen = c.lastUsed; liveTint = tint; liveDim = dim; }
+        return c.frame;
+    }
+
+    // Plays a GIF from raw bytes (e.g. downloaded for the Update Log). 'key' must be unique per GIF.
+    public static Texture GetData(string key, byte[] data)
+    {
+        if (string.IsNullOrEmpty(key)) return null;
+        Clip c;
+        if (!clips.TryGetValue(key, out c))
+        {
+            c = new Clip { guid = key, t0 = EditorApplication.timeSinceStartup };
+            clips[key] = c;
+            try
+            {
+                if (data == null || data.Length > MaxGifBytes || !DecodeGif(data, c) || c.frames.Count == 0) c.error = "Could not read this GIF.";
+                else c.frame = c.frames[0];
+            }
+            catch (System.Exception e) { c.error = e.Message; }
+            if (!hooked) { hooked = true; EditorApplication.update += Tick; }
+        }
+        c.lastUsed = EditorApplication.timeSinceStartup;
+        return c.frame;
+    }
+
+    // True once the first real frame is on screen (videos need a moment to start).
+    public static bool Ready(string guid)
+    {
+        Clip c;
+        if (string.IsNullOrEmpty(guid) || !clips.TryGetValue(guid, out c) || c.error != null) return false;
+        if (c.isVideo) return c.vp != null && c.vp.isPlaying && c.vp.time > 0.25;
+        return c.frame != null;
+    }
+
+    private static void Load(Clip c)
+    {
+        string path = AssetDatabase.GUIDToAssetPath(c.guid);
+        if (string.IsNullOrEmpty(path)) { c.error = "File not found."; return; }
+        UnityEngine.Video.VideoClip vc = AssetDatabase.LoadAssetAtPath<UnityEngine.Video.VideoClip>(path);
+        if (vc != null)
+        {
+            c.isVideo = true;
+            float w = Mathf.Max(16f, vc.width), h = Mathf.Max(16f, vc.height);
+            float sc = Mathf.Min(1f, MaxDim / Mathf.Max(w, h));
+            c.rt = new RenderTexture(Mathf.Max(16, Mathf.RoundToInt(w * sc)), Mathf.Max(16, Mathf.RoundToInt(h * sc)), 0, RenderTextureFormat.ARGB32) { hideFlags = HideFlags.HideAndDontSave };
+            c.go = new GameObject("OuterAI_BgVideo") { hideFlags = HideFlags.HideAndDontSave };
+            c.vp = c.go.AddComponent<UnityEngine.Video.VideoPlayer>();
+            c.vp.playOnAwake = false;
+            c.vp.isLooping = true;
+            c.vp.audioOutputMode = UnityEngine.Video.VideoAudioOutputMode.None;
+            c.vp.renderMode = UnityEngine.Video.VideoRenderMode.RenderTexture;
+            c.vp.targetTexture = c.rt;
+            c.vp.clip = vc;
+            c.vp.Play();
+            c.frame = c.rt;
+            return;
+        }
+        if (path.EndsWith(".gif", System.StringComparison.OrdinalIgnoreCase))
+        {
+            System.IO.FileInfo fi = new System.IO.FileInfo(path);
+            if (fi.Length > MaxGifBytes) { c.error = "GIF is bigger than 20 MB."; return; }
+            if (!DecodeGif(System.IO.File.ReadAllBytes(path), c) || c.frames.Count == 0) { c.error = "Could not read this GIF."; return; }
+            c.frame = c.frames[0];
+            return;
+        }
+        c.error = "Use a video clip or a .gif file.";
+    }
+
+    private static void Unload(Clip c)
+    {
+        foreach (Texture2D t in c.frames) if (t != null) Object.DestroyImmediate(t);
+        c.frames.Clear();
+        if (c.vp != null) c.vp.Stop();
+        if (c.go != null) Object.DestroyImmediate(c.go);
+        if (c.rt != null) { c.rt.Release(); Object.DestroyImmediate(c.rt); }
+    }
+
+    private static void Tick()
+    {
+        double now = EditorApplication.timeSinceStartup;
+        bool anyVideo = false, changed = false, liveNow = false;
+        float tdt = Mathf.Clamp((float)(now - lastTick), 0f, 0.1f);
+        lastTick = now;
+        List<string> dead = null;
+        foreach (KeyValuePair<string, Clip> kv in clips)
+        {
+            Clip c = kv.Value;
+            if (OnFrame == null || now - c.lastUsed > IdleSeconds)
+            {
+                if (dead == null) dead = new List<string>();
+                dead.Add(kv.Key);
+                continue;
+            }
+            if (c.error != null) continue;
+            if (c.live && now - c.liveSeen < 1.0 && c.frame != null)
+            {
+                liveNow = true;
+                if (now - lastAnalyze > 0.1) { lastAnalyze = now; Analyze(c); }
+            }
+            if (c.isVideo) { anyVideo = true; changed = true; }
+            else if (c.frames.Count > 1 && c.total > 0f)
+            {
+                float t = (float)((now - c.t0) % c.total);
+                int i = 0;
+                while (i < c.frames.Count - 1 && t >= c.delays[i]) { t -= c.delays[i]; i++; }
+                if (i != c.idx) { c.idx = i; c.frame = c.frames[i]; changed = true; }
+            }
+        }
+        if (dead != null)
+            foreach (string k in dead) { Unload(clips[k]); clips.Remove(k); }
+        if (liveNow && liveInit)
+        {
+            float k = 1f - Mathf.Exp(-tdt * 7f);
+            LiveLum += (tgtLum - LiveLum) * k;
+            LiveVivid = Color.Lerp(LiveVivid, tgtViv, k);
+            Color dv = LiveVivid - stampViv;
+            if (Mathf.Abs(LiveLum - stampLum) > 0.012f || Mathf.Abs(dv.r) + Mathf.Abs(dv.g) + Mathf.Abs(dv.b) > 0.03f)
+            { stampLum = LiveLum; stampViv = LiveVivid; LiveStamp++; changed = true; }
+        }
+        else if (!liveNow && LiveReady) ResetLive();
+        if (clips.Count == 0) { ResetLive(); EditorApplication.update -= Tick; hooked = false; return; }
+        if (anyVideo) EditorApplication.QueuePlayerLoopUpdate();
+        if (changed && now - lastRepaint > 0.012)
+        {
+            lastRepaint = now;
+            if (OnFrame != null) OnFrame();
+        }
+    }
+
+    // ---------------- small self contained GIF decoder (no System.Drawing needed) ----------------
+    private static bool DecodeGif(byte[] d, Clip c)
+    {
+        if (d.Length < 13 || d[0] != 'G' || d[1] != 'I' || d[2] != 'F') return false;
+        int W = d[6] | (d[7] << 8), H = d[8] | (d[9] << 8);
+        if (W <= 0 || H <= 0) return false;
+        int p = 13;
+        Color32[] gct = null;
+        if ((d[10] & 0x80) != 0) gct = ReadPal(d, ref p, 2 << (d[10] & 7));
+        Color32[] canvas = new Color32[W * H];
+        int scale = Mathf.Max(1, Mathf.CeilToInt(Mathf.Max(W, H) / (float)MaxDim));
+        int delay = 10, disp = 0, trans = -1, decoded = 0;
+        while (p < d.Length && decoded < 800)
+        {
+            byte b = d[p++];
+            if (b == 0x3B) break;
+            if (b == 0x21)
+            {
+                byte label = d[p++];
+                if (label == 0xF9 && d[p] >= 4)
+                {
+                    int f = d[p + 1];
+                    disp = (f >> 2) & 7;
+                    delay = d[p + 2] | (d[p + 3] << 8);
+                    trans = (f & 1) != 0 ? d[p + 4] : -1;
+                }
+                SkipBlocks(d, ref p);
+            }
+            else if (b == 0x2C)
+            {
+                int ix = d[p] | (d[p + 1] << 8), iy = d[p + 2] | (d[p + 3] << 8);
+                int iw = d[p + 4] | (d[p + 5] << 8), ih = d[p + 6] | (d[p + 7] << 8);
+                int f = d[p + 8]; p += 9;
+                Color32[] pal = gct;
+                if ((f & 0x80) != 0) pal = ReadPal(d, ref p, 2 << (f & 7));
+                bool interlaced = (f & 0x40) != 0;
+                int minCode = d[p++];
+                System.IO.MemoryStream ms = new System.IO.MemoryStream();
+                while (p < d.Length && d[p] != 0) { int n = d[p]; ms.Write(d, p + 1, Mathf.Min(n, d.Length - p - 1)); p += n + 1; }
+                p++;
+                byte[] idx = Lzw(ms.ToArray(), minCode, iw * ih);
+                Color32[] saved = disp == 3 ? (Color32[])canvas.Clone() : null;
+                if (pal != null)
+                {
+                    int[] rows = RowOrder(ih, interlaced);
+                    for (int row = 0; row < ih; row++)
+                    {
+                        int y = iy + rows[row];
+                        if (y < 0 || y >= H) continue;
+                        for (int col = 0; col < iw; col++)
+                        {
+                            int x = ix + col;
+                            if (x < 0 || x >= W) continue;
+                            int v = idx[row * iw + col];
+                            if (v == trans || v >= pal.Length) continue;
+                            canvas[y * W + x] = pal[v];
+                        }
+                    }
+                }
+                c.frames.Add(Shrink(canvas, W, H, scale));
+                c.delays.Add(Mathf.Max(delay, 2) * 0.01f);
+                decoded++;
+                if (disp == 2)
+                {
+                    for (int y = iy; y < Mathf.Min(H, iy + ih); y++)
+                        for (int x = ix; x < Mathf.Min(W, ix + iw); x++) canvas[y * W + x] = new Color32(0, 0, 0, 0);
+                }
+                else if (disp == 3 && saved != null) canvas = saved;
+                disp = 0; delay = 10; trans = -1;
+            }
+            else break;
+        }
+        if (c.frames.Count == 0) return false;
+        int cap = Mathf.Max(60, (int)(MaxFrameBytes / (4L * c.frames[0].width * c.frames[0].height)));
+        while (c.frames.Count > cap)   // only when over the memory budget: thin out, keep total duration
+        {
+            List<Texture2D> nf = new List<Texture2D>(); List<float> nd = new List<float>();
+            for (int i = 0; i < c.frames.Count; i += 2)
+            {
+                nf.Add(c.frames[i]);
+                nd.Add(c.delays[i] + (i + 1 < c.frames.Count ? c.delays[i + 1] : 0f));
+                if (i + 1 < c.frames.Count) Object.DestroyImmediate(c.frames[i + 1]);
+            }
+            c.frames = nf; c.delays = nd;
+        }
+        c.total = 0f; foreach (float x in c.delays) c.total += x;
+        return c.frames.Count > 0;
+    }
+    private static Color32[] ReadPal(byte[] d, ref int p, int n)
+    {
+        Color32[] pal = new Color32[n];
+        for (int i = 0; i < n && p + 2 < d.Length; i++) { pal[i] = new Color32(d[p], d[p + 1], d[p + 2], 255); p += 3; }
+        return pal;
+    }
+    private static void SkipBlocks(byte[] d, ref int p)
+    {
+        while (p < d.Length && d[p] != 0) p += d[p] + 1;
+        p++;
+    }
+    private static int[] RowOrder(int h, bool interlaced)
+    {
+        int[] r = new int[h];
+        if (!interlaced) { for (int i = 0; i < h; i++) r[i] = i; return r; }
+        int n = 0;
+        int[] start = { 0, 4, 2, 1 }, step = { 8, 8, 4, 2 };
+        for (int pass = 0; pass < 4; pass++)
+            for (int y = start[pass]; y < h; y += step[pass]) r[n++] = y;
+        return r;
+    }
+    private static Texture2D Shrink(Color32[] src, int W, int H, int scale)
+    {
+        int w = Mathf.Max(1, W / scale), h = Mathf.Max(1, H / scale);
+        Color32[] dst = new Color32[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int r = 0, g = 0, b = 0, a = 0, n = 0;
+                for (int sy = 0; sy < scale; sy++)
+                    for (int sx = 0; sx < scale; sx++)
+                    {
+                        int px = x * scale + sx, py = y * scale + sy;
+                        if (px >= W || py >= H) continue;
+                        Color32 c = src[py * W + px];
+                        r += c.r; g += c.g; b += c.b; a += c.a; n++;
+                    }
+                if (n > 0) dst[(h - 1 - y) * w + x] = new Color32((byte)(r / n), (byte)(g / n), (byte)(b / n), (byte)(a / n));
+            }
+        Texture2D t = new Texture2D(w, h, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave, wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear };
+        t.SetPixels32(dst);
+        t.Apply(false, true);
+        return t;
+    }
+    private static byte[] Lzw(byte[] data, int minCode, int pixels)
+    {
+        byte[] outp = new byte[pixels];
+        if (minCode < 1 || minCode > 11) return outp;
+        int clear = 1 << minCode, eoi = clear + 1, next = eoi + 1, size = minCode + 1, mask = (1 << size) - 1;
+        short[] prefix = new short[4096]; byte[] suffix = new byte[4096]; byte[] stack = new byte[4097];
+        for (int i = 0; i < clear; i++) suffix[i] = (byte)i;
+        int old = -1, bits = 0, datum = 0, bp = 0, o = 0; byte first = 0;
+        while (o < pixels)
+        {
+            while (bits < size)
+            {
+                if (bp >= data.Length) return outp;
+                datum |= data[bp++] << bits; bits += 8;
+            }
+            int code = datum & mask; datum >>= size; bits -= size;
+            if (code == clear) { size = minCode + 1; mask = (1 << size) - 1; next = eoi + 1; old = -1; continue; }
+            if (code == eoi) break;
+            if (old == -1)
+            {
+                if (code >= clear) return outp;
+                outp[o++] = suffix[code]; old = code; first = suffix[code]; continue;
+            }
+            int inCode = code, top = 0;
+            if (code >= next) { stack[top++] = first; code = old; }
+            while (code >= clear && top < 4096) { stack[top++] = suffix[code]; code = prefix[code]; }
+            first = suffix[code]; stack[top++] = first;
+            if (next < 4096)
+            {
+                prefix[next] = (short)old; suffix[next] = first; next++;
+                if ((next & mask) == 0 && next < 4096) { size++; mask = (1 << size) - 1; }
+            }
+            old = inCode;
+            while (top > 0 && o < pixels) outp[o++] = stack[--top];
+        }
+        return outp;
+    }
+}
+
 public abstract class OuterAIThemedEditor : Editor
 {
 protected virtual string LogoText { get { return "OUTER AI"; } }
@@ -591,6 +1075,147 @@ protected string logoHighText;
 protected GUIStyle tabOffStyle;
 protected GUIStyle tabOnStyle;
 protected Texture2D tabOffTex, tabHoverTex, tabOnTex;
+protected GUIStyle tabTextStyle;
+protected bool animDetect;
+
+// ---------------- LIVE GLASS LOOK (animated backgrounds) ----------------
+protected static Rect liveBgRect;
+protected static float liveK;                    // 0 = dark background, 1 = light background
+private static ThemeData liveTh;
+private static int liveStampSeen = -1, liveThemeVer = -1;
+private Color logoBuiltCol;
+protected static bool IsLive(ThemeData t)
+{
+    return t != null && t.bgMode == 3 && t.liveColors && !string.IsNullOrEmpty(t.bgAnim) && OuterAIAnimBg.LiveReady && OuterAIAnimBg.BlurTex != null;
+}
+// The theme colors to actually draw with: the saved theme, or (animated + live) a copy that follows the picture.
+protected static ThemeData Tc
+{
+    get
+    {
+        bool live = IsLive(Cur);
+        if (!live && !Cur.glossy) return Cur;
+        int key = live ? OuterAIAnimBg.LiveStamp : -2;
+        if (liveTh == null || liveStampSeen != key || liveThemeVer != themeVersion)
+        {
+            liveTh = Cur.Copy();
+            if (live) ApplyLive(liveTh);
+            if (Cur.glossy) ForceDarkText(liveTh);
+            liveStampSeen = key; liveThemeVer = themeVersion;
+        }
+        return liveTh;
+    }
+}
+// Aero themes: every piece of text is dark (deep blue), whatever the background looks like.
+protected static void ForceDarkText(ThemeData t)
+{
+    Color dark = new Color(0.03f, 0.15f, 0.28f);
+    t.titleColor = dark;
+    t.sub = new Color(0.08f, 0.28f, 0.46f);
+    t.tabText = dark; t.tabTextOn = dark;
+    t.logo = Color.Lerp(t.logo, Color.black, 0.40f);
+    t.outlineColor = new Color(1f, 1f, 1f, 0.9f); t.autoOutline = false;
+}
+protected static void ApplyLive(ThemeData t)
+{
+    float k = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.45f, 0.65f, OuterAIAnimBg.LiveLum));
+    liveK = k;
+    float h, sat, v; Color.RGBToHSV(OuterAIAnimBg.LiveVivid, out h, out sat, out v);
+    Color accent = Color.HSVToRGB(h, Mathf.Clamp(sat, 0.35f, 0.95f), Mathf.Lerp(0.95f, 0.38f, k));
+    Color lite = new Color(0.97f, 0.96f, 1f), dark = new Color(0.03f, 0.03f, 0.05f);
+    Color text = Color.Lerp(lite, dark, k);
+    t.titleColor = text;
+    t.sub = Color.Lerp(text, accent, 0.22f);
+    t.tabText = text; t.tabTextOn = text;
+    t.tabOff = new Color(1f, 1f, 1f, Mathf.Lerp(0.10f, 0.26f, k));
+    t.tabHover = new Color(1f, 1f, 1f, Mathf.Lerp(0.20f, 0.42f, k));
+    Color on = Color.Lerp(Color.white, accent, 0.30f); on.a = Mathf.Lerp(0.30f, 0.55f, k);
+    t.tabOn = on;
+    t.logo = accent;
+    t.autoOutline = true;
+    t.borderColor = new Color(1f, 1f, 1f, Mathf.Lerp(0.35f, 0.60f, k));
+}
+// Frosted glass: the blurred picture behind the box + white frost + soft top shine + bright edge.
+// Windows 7 style glossy sheen: bright upper half with a crisp split, dark outer line and white inner line.
+protected static void DrawGloss(Rect r, float a, float radius)
+{
+    GUI.DrawTexture(new Rect(r.x - 1f, r.y - 1f, r.width + 2f, r.height + 2f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(0.04f, 0.24f, 0.44f, 0.38f), 1f, radius + 1f);
+    float half = (r.height - 2f) * 0.5f;
+    const int n = 6;
+    float sh = half / n;
+    for (int i = 0; i < n; i++)
+        GUI.DrawTexture(new Rect(r.x + 1f, r.y + 1f + i * sh, r.width - 2f, sh + 0.5f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, a * (1f - 0.55f * i / n)), 0f, 0f);
+    GUI.DrawTexture(new Rect(r.x + 1f, r.y + 1f + half, r.width - 2f, r.height - 2f - half), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(0.1f, 0.5f, 0.85f, a * 0.12f), 0f, 0f);
+    GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, 0.80f), 1f, radius);
+}
+protected void DrawGlass(Rect r)
+{
+    ThemeData tc = Tc;
+    float k = liveK;
+    Texture2D blur = OuterAIAnimBg.BlurTex;
+    if (blur != null && liveBgRect.width > 1f)
+    {
+        // Same size/crop as the real background, so the blur lines up with the picture and is never squished.
+        Rect bgR = new Rect(liveBgRect.x - r.x, liveBgRect.y - r.y, liveBgRect.width, liveBgRect.height);
+        Rect img = bgR;
+        float asp = Mathf.Max(0.1f, OuterAIAnimBg.BlurAspect);
+        if (Cur.imageFit != 1)
+        {
+            float sc = Cur.imageFit == 2 ? Mathf.Min(bgR.width / asp, bgR.height) : Mathf.Max(bgR.width / asp, bgR.height);
+            float iw = sc * asp, ih = sc;
+            img = new Rect(bgR.center.x - iw * 0.5f, bgR.center.y - ih * 0.5f, iw, ih);
+        }
+        GUI.BeginGroup(r);
+        Color tint = Color.Lerp(Cur.imageTint, Color.black, Mathf.Clamp01(Cur.imageDim));
+        if (Cur.imageFit == 2) GUI.DrawTexture(bgR, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Cur.solid, 0f, 0f);
+        GUI.DrawTexture(img, blur, ScaleMode.StretchToFill, true, 0f, tint, 0f, 0f);
+        GUI.EndGroup();
+    }
+    GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, Mathf.Lerp(0.14f, 0.38f, k)), 0f, 4f);
+    GUI.DrawTexture(new Rect(r.x, r.y, r.width, Mathf.Min(r.height * 0.5f, 26f)), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, Mathf.Lerp(0.06f, 0.12f, k)), 0f, 4f);
+    GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, tc.borderColor, 1f, 4f);
+    if (Cur.glossy) DrawGloss(r, 0.16f, 4f);
+}
+
+// ---------------- UI ANIMATION ----------------
+// Values step in the Layout event (so Layout and Repaint always match), targets are set while painting.
+private double animOpen = -1, animLast;
+private float animDt, animElapsed = 99f;
+private int animSection;
+private readonly Dictionary<string, float> animVals = new Dictionary<string, float>();
+private readonly Dictionary<string, float> animTarget = new Dictionary<string, float>();
+protected static float EaseOut(float t) { t = Mathf.Clamp01(t); return 1f - Mathf.Pow(1f - t, 3f); }
+protected static Color AColor(Color c, float a) { c.a *= a; return c; }
+protected void TickAnim()
+{
+    if (Event.current.type != EventType.Layout) return;
+    double now = EditorApplication.timeSinceStartup;
+    if (animOpen < 0) animOpen = now;
+    animDt = Mathf.Clamp((float)(now - animLast), 0f, 0.05f);
+    animLast = now;
+    animElapsed = (float)(now - animOpen);
+    animSection = 0;
+    if (pendingToggle != null) { if (!collapsedSections.Remove(pendingToggle)) collapsedSections.Add(pendingToggle); pendingToggle = null; }
+    float k = 1f - Mathf.Exp(-animDt * 18f);
+    foreach (string key in new List<string>(animTarget.Keys))
+    {
+        float v = animVals[key], t = animTarget[key];
+        v = Mathf.Abs(t - v) < 0.01f ? t : Mathf.Lerp(v, t, k);
+        animVals[key] = v;
+    }
+}
+protected float AnimGet(string key, float target)
+{
+    if (!animVals.ContainsKey(key)) animVals[key] = target;
+    animTarget[key] = target;
+    if (!Mathf.Approximately(animVals[key], target)) Repaint();
+    return animVals[key];
+}
+protected void BeginFade()
+{
+    float a = EaseOut(animElapsed / 0.35f);
+    if (a < 1f) { GUI.color = new Color(1f, 1f, 1f, a); Repaint(); }
+}
 protected readonly Dictionary<string, ReorderableList> lists = new Dictionary<string, ReorderableList>();
 protected const string ThemePref = "OuterAI.Theme.";
 [System.Serializable]
@@ -621,6 +1246,10 @@ public Color outlineColor;
 public Color boxColor, borderColor;
 public int borderWidth, bgPadding, sectionGap, tabsPerRow;
 public bool titleCenter, subItalic;
+public bool autoImageColors;
+public string bgAnim;
+public bool liveColors;
+public bool glossy;               // Windows 7 / Frutiger Aero look: glossy tabs + glass boxes + soft bokeh
 public ThemeData Copy() { return (ThemeData)MemberwiseClone(); }
 public bool Same(ThemeData o) { return JsonUtility.ToJson(this) == JsonUtility.ToJson(o); }
 }
@@ -637,7 +1266,7 @@ return c;
 protected static float Lum(Color c) { return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
 protected static bool LightBg(ThemeData t)
 {
-if (t == null || t.bgMode == 2) return false;
+if (t == null || t.bgMode >= 2) return false;
 float l = t.bgMode == 1 ? Lum(t.solid) : (Lum(t.top) + Lum(t.bottom)) * 0.5f;
 return l > 0.55f;
 }
@@ -646,7 +1275,7 @@ protected static ThemeData EnsureContrast(ThemeData t)
 if (t == null) return t;
 Color dark = new Color(0.07f, 0.07f, 0.10f);
 Color lite = new Color(0.96f, 0.94f, 1f);
-if (t.bgMode != 2)
+if (t.bgMode < 2)
 {
 float bgL = t.bgMode == 1 ? Lum(t.solid) : (Lum(t.top) + Lum(t.bottom)) * 0.5f;
 if (bgL > 0.55f)
@@ -666,18 +1295,82 @@ if (Lum(t.tabOn) > 0.55f) { if (Lum(t.tabTextOn) > 0.45f) t.tabTextOn = dark; }
 else if (Lum(t.tabOn) < 0.45f) { if (Lum(t.tabTextOn) < 0.5f) t.tabTextOn = Color.white; }
 return t;
 }
+// ---- Auto color detection from the background image ----
+// Reads a tiny 24x24 copy of the image (works even if the texture is not Read/Write), finds the average
+// color and the most vivid color, then rebuilds boxes, tabs, titles, logo and border to match it.
+protected static bool SampleImage(Texture img, out Color avg, out Color vivid)
+{
+    avg = vivid = Color.gray;
+    if (img == null) return false;
+    RenderTexture rt = RenderTexture.GetTemporary(24, 24, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+    RenderTexture prev = RenderTexture.active;
+    Texture2D tmp = null;
+    try
+    {
+        Graphics.Blit(img, rt);
+        RenderTexture.active = rt;
+        tmp = new Texture2D(24, 24, TextureFormat.RGBA32, false);
+        tmp.ReadPixels(new Rect(0, 0, 24, 24), 0, 0);
+        Color[] px = tmp.GetPixels();
+        Color sum = Color.black, vsum = Color.black; float vw = 0f, n = 0f;
+        foreach (Color c in px)
+        {
+            if (c.a < 0.1f) continue;
+            sum += c; n += 1f;
+            float h, sat, v; Color.RGBToHSV(c, out h, out sat, out v);
+            float w = sat * sat * v + 0.0001f;
+            vsum += c * w; vw += w;
+        }
+        if (n < 1f) return false;
+        avg = sum / n; avg.a = 1f;
+        vivid = vsum / vw; vivid.a = 1f;
+        return true;
+    }
+    catch (System.Exception) { return false; }
+    finally
+    {
+        RenderTexture.active = prev;
+        RenderTexture.ReleaseTemporary(rt);
+        if (tmp != null) Object.DestroyImmediate(tmp);
+    }
+}
+protected static void ApplyImageColors(ThemeData t, Texture img)
+{
+    Color avg, vivid;
+    if (t == null || !SampleImage(img, out avg, out vivid)) return;
+    Color eff = avg * t.imageTint; eff.a = 1f;
+    eff = Color.Lerp(eff, Color.black, Mathf.Clamp01(t.imageDim));
+    bool darkBg = Lum(eff) < 0.5f;
+    float h, sat, v; Color.RGBToHSV(vivid, out h, out sat, out v);
+    Color accent = Color.HSVToRGB(h, Mathf.Clamp(sat, 0.35f, 0.95f), darkBg ? Mathf.Max(v, 0.85f) : Mathf.Min(v, 0.45f));
+    Color baseC = darkBg ? Color.Lerp(eff, Color.black, 0.65f) : Color.Lerp(eff, Color.white, 0.55f);
+    Color lite = new Color(0.96f, 0.94f, 1f), dark = new Color(0.07f, 0.07f, 0.10f);
+    t.boxColor = darkBg ? new Color(0f, 0f, 0f, 0.42f) : new Color(1f, 1f, 1f, 0.55f);
+    t.borderColor = new Color(accent.r, accent.g, accent.b, 0.55f);
+    t.logo = accent;
+    t.autoOutline = true;
+    t.titleColor = darkBg ? lite : dark;
+    t.sub = darkBg ? Color.Lerp(lite, accent, 0.25f) : Color.Lerp(dark, accent, 0.20f);
+    t.tabOff = new Color(Mathf.Lerp(baseC.r, accent.r, 0.30f), Mathf.Lerp(baseC.g, accent.g, 0.30f), Mathf.Lerp(baseC.b, accent.b, 0.30f), 0.88f);
+    t.tabHover = new Color(Mathf.Lerp(baseC.r, accent.r, 0.65f), Mathf.Lerp(baseC.g, accent.g, 0.65f), Mathf.Lerp(baseC.b, accent.b, 0.65f), 0.95f);
+    t.tabOn = darkBg ? Color.Lerp(accent, Color.black, 0.30f) : Color.Lerp(accent, Color.black, 0.15f);
+    t.tabText = darkBg ? lite : dark;
+    t.tabTextOn = Color.white;
+    t.solid = eff; // shown behind the image when "Fit Inside" is used
+    EnsureContrast(t);
+}
 protected static ThemeData Blank(string name)
 {
 return new ThemeData
 {
 ver = 6, name = name, bgMode = 0, radius = 6f,
-bgImage = "", imageFit = 0, imageTint = Color.white, imageDim = 0f,
+bgImage = "", bgAnim = "", liveColors = true, imageFit = 0, imageTint = Color.white, imageDim = 0f,
 tabText = new Color(0.85f, 0.82f, 1f), tabTextOn = Color.white, tabHeight = 30, tabFontSize = 10,
 uiFont = "", titleColor = new Color(0.96f, 0.92f, 1f), sub = new Color(0.8f, 0.8f, 0.9f), titleSize = 15, subSize = 11,
 logoGradient = true, logoHighlight = true, logoOutline = true, logoSize = 28, logoBold = true, logoFont = "",
 showLogo = true, autoOutline = true, outlineColor = new Color(0.28f, 0.06f, 0.55f),
 boxColor = new Color(0f, 0f, 0f, 0f), borderColor = new Color(1f, 1f, 1f, 0.25f),
-borderWidth = 0, bgPadding = 14, sectionGap = 6, tabsPerRow = 3, titleCenter = true, subItalic = true
+borderWidth = 0, bgPadding = 14, sectionGap = 6, tabsPerRow = 3, titleCenter = true, subItalic = true, autoImageColors = true
 };
 }
 protected static ThemeData Dark(string name, Color accent)
@@ -822,7 +1515,24 @@ curFont = LoadFont(Cur.logoFont);
 curUiFont = LoadFont(Cur.uiFont);
 curBg = LoadTex(Cur.bgImage);
 }
-protected static void DrawImage(Rect r, Texture2D img, ThemeData t)
+protected static Texture BgTex(ThemeData t)
+{
+if (t == null) return null;
+if (t.bgMode == 2) return curBg;
+if (t.bgMode == 3) return OuterAIAnimBg.Get(t.bgAnim, t.liveColors, t.imageTint, t.imageDim);
+return null;
+}
+protected static string AnimGuid(Object o)
+{
+return OuterAIAnimBg.IsValidAsset(o) ? AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(o)) : null;
+}
+protected static Object LoadAnim(string guid)
+{
+if (string.IsNullOrEmpty(guid)) return null;
+string p = AssetDatabase.GUIDToAssetPath(guid);
+return string.IsNullOrEmpty(p) ? null : AssetDatabase.LoadAssetAtPath<Object>(p);
+}
+protected static void DrawImage(Rect r, Texture img, ThemeData t)
 {
 GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, t.solid, 0f, t.radius);
 ScaleMode m = t.imageFit == 1 ? ScaleMode.StretchToFill : t.imageFit == 2 ? ScaleMode.ScaleToFit : ScaleMode.ScaleAndCrop;
@@ -925,6 +1635,7 @@ if (tabHoverTex != null) DestroyImmediate(tabHoverTex);
 if (tabOnTex != null) DestroyImmediate(tabOnTex);
 tabOffTex = tabHoverTex = tabOnTex = null;
 tabOffStyle = tabOnStyle = null;
+tabTextStyle = null;
 sectionTitleStyle = null;
 noteStyle = null;
 subStyle = null;
@@ -947,11 +1658,224 @@ if (pend.bgMode == 2)
 Texture2D img = LoadTex(pend.bgImage);
 if (img != null) { DrawImage(r, img, pend); return; }
 }
+if (pend.bgMode == 3)
+{
+Texture af = OuterAIAnimBg.Get(pend.bgAnim);
+if (af != null) { DrawImage(r, af, pend); return; }
+}
 if (pend.bgMode == 1) { EditorGUI.DrawRect(r, pend.solid); return; }
 const int n = 16;
 float h = r.height / n;
 for (int i = 0; i < n; i++)
 EditorGUI.DrawRect(new Rect(r.x, r.y + i * h, r.width, h + 1f), Color.Lerp(pend.top, pend.bottom, i / (n - 1f)));
+}
+// ---------------------------------------------------------------------------------------------
+// HOLIDAY THEMES: each one unlocks by itself when its dates start (using the computer's date) and locks again
+// after. "Auto Switch On Holidays" also applies it for you once when it starts, and puts your old theme back
+// when it ends.
+// ---------------------------------------------------------------------------------------------
+protected class Holiday
+{
+    public string id, name;
+    public int sm, sd, em, ed;          // start month/day, end month/day (inclusive)
+    public bool easter;                 // moves every year: 2 weeks before Easter until Easter Monday
+    public System.Func<ThemeData> make;
+}
+private static List<Holiday> holidayList;
+protected static List<Holiday> Holidays()
+{
+    if (holidayList != null) return holidayList;
+    holidayList = new List<Holiday>
+    {
+        new Holiday { id = "newyear", name = "New Year", sm = 1, sd = 1, em = 1, ed = 7, make = MakeNewYear },
+        new Holiday { id = "valentine", name = "Valentine's", sm = 2, sd = 1, em = 2, ed = 15, make = MakeValentine },
+        new Holiday { id = "patrick", name = "St. Patrick's", sm = 3, sd = 10, em = 3, ed = 18, make = MakePatrick },
+        new Holiday { id = "easter", name = "Easter", easter = true, make = MakeEaster },
+        new Holiday { id = "july4", name = "4th of July", sm = 6, sd = 28, em = 7, ed = 5, make = MakeJuly4 },
+        new Holiday { id = "halloween", name = "Halloween", sm = 10, sd = 1, em = 10, ed = 31, make = MakeHalloween },
+        new Holiday { id = "thanks", name = "Thanksgiving", sm = 11, sd = 1, em = 11, ed = 30, make = MakeThanksgiving },
+        new Holiday { id = "xmas", name = "Christmas", sm = 12, sd = 1, em = 12, ed = 31, make = MakeChristmas },
+    };
+    return holidayList;
+}
+protected static System.DateTime EasterDate(int y)
+{
+    int a = y % 19, b = y / 100, c = y % 100, d = b / 4, e = b % 4, f = (b + 8) / 25, g = (b - f + 1) / 3;
+    int h = (19 * a + b - d - g + 15) % 30, i = c / 4, k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+    int m = (a + 11 * h + 22 * l) / 451;
+    int month = (h + l - 7 * m + 114) / 31, day = ((h + l - 7 * m + 114) % 31) + 1;
+    return new System.DateTime(y, month, day);
+}
+// start (inclusive) and end (exclusive) of a holiday in a given year
+protected static void HolidayWindow(Holiday h, int year, out System.DateTime start, out System.DateTime end)
+{
+    if (h.easter) { System.DateTime ea = EasterDate(year); start = ea.AddDays(-14); end = ea.AddDays(2); return; }
+    start = new System.DateTime(year, h.sm, h.sd);
+    end = new System.DateTime(year, h.em, h.ed).AddDays(1);
+}
+protected static bool HolidayActive(Holiday h, System.DateTime now)
+{
+    System.DateTime s, e; HolidayWindow(h, now.Year, out s, out e);
+    return now.Date >= s && now.Date < e;
+}
+protected static Holiday ActiveHoliday(System.DateTime now)
+{
+    foreach (Holiday h in Holidays()) if (HolidayActive(h, now)) return h;
+    return null;
+}
+protected static int HolidayDaysLeft(Holiday h, System.DateTime now)
+{
+    System.DateTime s, e; HolidayWindow(h, now.Year, out s, out e);
+    return Mathf.Max(0, (e - now.Date).Days);
+}
+protected static System.DateTime HolidayNextStart(Holiday h, System.DateTime now)
+{
+    System.DateTime s, e; HolidayWindow(h, now.Year, out s, out e);
+    if (now.Date >= e) HolidayWindow(h, now.Year + 1, out s, out e);
+    return s;
+}
+// Dev switch: unlocks every holiday theme in the list so they can be previewed any day of the year.
+// Kept per editor session (resets when Unity restarts). Does not change the automatic switching.
+public static bool HolidayPreviewAll
+{
+    get { return SessionState.GetBool("OuterAI.HolidayPreviewAll", false); }
+    set { SessionState.SetBool("OuterAI.HolidayPreviewAll", value); InternalEditorUtility.RepaintAllViews(); }
+}
+protected static bool IsHolidayName(string n)
+{
+    foreach (Holiday h in Holidays()) if (h.name == n) return true;
+    return false;
+}
+protected static void SetCurrentTheme(ThemeData t)
+{
+    Cur = t;
+    EditorPrefs.SetString(ThemePref + "json", JsonUtility.ToJson(Cur));
+    RefreshFont();
+    themeVersion++;
+    InternalEditorUtility.RepaintAllViews();
+}
+// Called once a minute (and when the editor opens) by OuterAIHolidayWatcher.
+internal static void HolidayTick()
+{
+    try
+    {
+        if (!EditorPrefs.GetBool(ThemePref + "AutoHoliday", true)) return;
+        System.DateTime now = System.DateTime.Now;
+        Holiday act = ActiveHoliday(now);
+        string prevKey = ThemePref + "HolidayPrev", doneKey = ThemePref + "HolidayDone";
+        if (act != null)
+        {
+            string tag = act.id + "|" + now.Year;
+            if (EditorPrefs.GetString(doneKey, "") == tag) return;     // already switched once for this holiday
+            EditorPrefs.SetString(doneKey, tag);
+            if (Cur.name == act.name) return;
+            if (!IsHolidayName(Cur.name)) EditorPrefs.SetString(prevKey, JsonUtility.ToJson(Cur));
+            SetCurrentTheme(EnsureContrast(act.make()));
+        }
+        else
+        {
+            string prev = EditorPrefs.GetString(prevKey, "");
+            if (string.IsNullOrEmpty(prev)) return;
+            EditorPrefs.DeleteKey(prevKey);
+            if (!IsHolidayName(Cur.name)) return;                      // you already picked something else
+            ThemeData t = JsonUtility.FromJson<ThemeData>(prev);
+            if (t != null && !string.IsNullOrEmpty(t.name)) SetCurrentTheme(t);
+        }
+    }
+    catch (System.Exception) { }
+}
+protected static ThemeData HolidayLook(ThemeData t, string title, string sub, string border, float box)
+{
+    t.titleColor = Hex(title); t.sub = Hex(sub);
+    t.boxColor = new Color(0f, 0f, 0f, box);
+    t.borderColor = WithAlpha(Hex(border), 0.55f); t.borderWidth = 1;
+    return t;
+}
+// Finds a file anywhere in the project by exact file name (e.g. "frutiger-aero.gif") and returns its GUID, or "".
+protected static string FindAsset(string fileName)
+{
+    string stem = System.IO.Path.GetFileNameWithoutExtension(fileName);
+    foreach (string g in AssetDatabase.FindAssets(stem))
+    {
+        string path = AssetDatabase.GUIDToAssetPath(g);
+        if (System.IO.Path.GetFileName(path).Equals(fileName, System.StringComparison.OrdinalIgnoreCase)) return g;
+    }
+    return "";
+}
+// Same look, but with the animated GIF behind it (live colors + frosted glass) when the GIF is in the project.
+protected static ThemeData AeroWithGif(string name, string gif)
+{
+    ThemeData t = MakeFrutigerAero();
+    t.name = name;
+    string g = FindAsset(gif);
+    if (g != "") { t.bgMode = 3; t.bgAnim = g; t.liveColors = true; t.imageFit = 0; }
+    return t;
+}
+protected static ThemeData MakeAeroTurbine() { return AeroWithGif("Aero Turbine", "frutiger-aero.gif"); }
+protected static ThemeData MakeAeroWater() { return AeroWithGif("Aero Water", "frutiger-aero-water.gif"); }
+protected static ThemeData MakeFrutigerAero()
+{
+    ThemeData t = Grad("Frutiger Aero", "3FA9F5", "8FE6C4", "1E88D8", "1FA3F0");
+    t.glossy = true;
+    t.tabOff = new Color(0.78f, 0.92f, 1f, 0.80f);
+    t.tabHover = new Color(0.90f, 0.97f, 1f, 0.92f);
+    t.tabOn = Hex("2B9BE8");
+    t.tabText = Hex("0B3A66"); t.tabTextOn = Color.white;
+    t.titleColor = Hex("08345E"); t.sub = Hex("14618F");
+    t.boxColor = new Color(1f, 1f, 1f, 0.38f);
+    t.borderColor = new Color(1f, 1f, 1f, 0.85f); t.borderWidth = 1;
+    t.autoOutline = false; t.outlineColor = new Color(1f, 1f, 1f, 0.9f);
+    return t;
+}
+protected static ThemeData MakeHalloween()
+{
+    ThemeData t = HolidayLook(Grad("Halloween", "0A0212", "4A1A00", "FF7A00", "FF8C1A"), "FFE2C2", "FFB066", "FF7A00", 0.35f);
+    t.autoOutline = false; t.outlineColor = Hex("2A0A40");
+    return t;
+}
+protected static ThemeData MakeThanksgiving() { return HolidayLook(Grad("Thanksgiving", "2A1206", "94521A", "D9822B", "FFB347"), "FFF1DC", "FFE0B8", "FFB347", 0.28f); }
+protected static ThemeData MakeChristmas() { return HolidayLook(Grad("Christmas", "062A14", "7A0A16", "C8102E", "FFD84D"), "FFFFFF", "FFF1C9", "FFD84D", 0.30f); }
+protected static ThemeData MakeNewYear() { return HolidayLook(Grad("New Year", "05050D", "3A2B00", "D4AF37", "FFE27A"), "FFF8DC", "FFF0B3", "D4AF37", 0.30f); }
+protected static ThemeData MakeValentine() { return HolidayLook(Grad("Valentine's", "2A0417", "B3135B", "E91E63", "FF9CC2"), "FFF0F6", "FFD1E3", "FF9CC2", 0.28f); }
+protected static ThemeData MakePatrick() { return HolidayLook(Grad("St. Patrick's", "03140A", "0E6B2E", "1FAA4D", "8CFFA8"), "F2FFF5", "D6FFE0", "8CFFA8", 0.28f); }
+protected static ThemeData MakeJuly4() { return HolidayLook(Grad("4th of July", "0A1A4A", "8E0C1E", "1E4FD8", "FFFFFF"), "FFFFFF", "DCE6FF", "FFFFFF", 0.30f); }
+protected static ThemeData MakeEaster()
+{
+    ThemeData t = HolidayLook(Grad("Easter", "8FD3F4", "F9C5E1", "B07CE8", "6A3FC9"), "2B2050", "4A3A7A", "B07CE8", 0f);
+    t.boxColor = new Color(1f, 1f, 1f, 0.35f);
+    return t;
+}
+protected void DrawHolidays()
+{
+    System.DateTime now = System.DateTime.Now;
+    bool auto = EditorPrefs.GetBool(ThemePref + "AutoHoliday", true);
+    bool na = EditorGUILayout.Toggle(new GUIContent("Auto Switch On Holidays", "Applies the holiday theme by itself when the holiday starts, and puts your old theme back when it ends."), auto);
+    if (na != auto) { EditorPrefs.SetBool(ThemePref + "AutoHoliday", na); if (na) HolidayTick(); }
+    Holiday act = ActiveHoliday(now);
+    GUILayout.Label(act != null ? "Unlocked now: " + act.name + " (" + HolidayDaysLeft(act, now) + " days left)" : "No holiday right now. Locked ones unlock on their dates.", EditorStyles.miniBoldLabel);
+    List<Holiday> all = Holidays();
+    for (int i = 0; i < all.Count; i += 2)
+    {
+        EditorGUILayout.BeginHorizontal();
+        for (int j = i; j < i + 2 && j < all.Count; j++)
+        {
+            Holiday h = all[j];
+            bool real = HolidayActive(h, now);
+            bool open = real || HolidayPreviewAll;
+            string label = h.name;
+            if (!open)
+            {
+                System.DateTime st = HolidayNextStart(h, now);
+                label += "\nLocked - unlocks " + st.ToString("MMM d", System.Globalization.CultureInfo.InvariantCulture) + " (in " + (st - now.Date).Days + " days)";
+            }
+            else label += real ? "\nUnlocked - " + HolidayDaysLeft(h, now) + " days left" : "\nPreview (locked in real life)";
+            bool was = GUI.enabled;
+            GUI.enabled = was && open;
+            if (GUILayout.Button(label, GUILayout.Height(36f))) pend = EnsureContrast(h.make());
+            GUI.enabled = was;
+        }
+        EditorGUILayout.EndHorizontal();
+    }
 }
 protected void DrawTheme()
 {
@@ -960,10 +1884,10 @@ DrawSection("Themes", () =>
 GUILayout.Label("Using now: " + Cur.name, EditorStyles.miniBoldLabel);
 string[] names = { "Default", "Dark Gold", "Bubblegum", "Dark Green", "Midnight Blue", "Calm Red",
 "Neon Purple", "Cyber Cyan", "Blood Moon", "Toxic Lime", "Ocean", "Sunset",
-"Monochrome", "Matrix", "Cherry Blossom", "Ghost White" };
+"Monochrome", "Matrix", "Cherry Blossom", "Ghost White", "Aero Turbine", "Aero Water" };
 System.Func<ThemeData>[] makers = { MakeDefault, MakeGold, MakeBubble, MakeGreen, MakeBlue, MakeRed,
 MakeNeonPurple, MakeCyber, MakeBlood, MakeToxic, MakeOcean, MakeSunset,
-MakeMono, MakeMatrix, MakeBlossom, MakeGhost };
+MakeMono, MakeMatrix, MakeBlossom, MakeGhost, MakeAeroTurbine, MakeAeroWater };
 for (int i = 0; i < names.Length; i += 4)
 {
 EditorGUILayout.BeginHorizontal();
@@ -973,12 +1897,15 @@ EditorGUILayout.EndHorizontal();
 }
 if (GUILayout.Button("Random Theme", GUILayout.Height(24f))) pend = EnsureContrast(makers[Random.Range(0, makers.Length)]());
 GUILayout.Label("Picked: " + pend.name, EditorStyles.miniLabel);
+pend.glossy = EditorGUILayout.Toggle(new GUIContent("Glossy Aero Style", "Windows 7 / Frutiger Aero look: glossy tabs and boxes. Works on any theme, also with animated backgrounds."), pend.glossy);
 });
+GUILayout.Space(Cur.sectionGap);
+DrawSection("Holiday Themes", DrawHolidays);
 GUILayout.Space(Cur.sectionGap);
 DrawSection("Background", () =>
 {
 EditorGUI.BeginChangeCheck();
-pend.bgMode = GUILayout.Toolbar(pend.bgMode, new[] { "Gradient", "One Color", "Image" }, GUILayout.Height(24f));
+pend.bgMode = GUILayout.Toolbar(pend.bgMode, new[] { "Gradient", "One Color", "Image", "Animated" }, GUILayout.Height(24f));
 if (pend.bgMode == 0)
 {
 pend.top = EditorGUILayout.ColorField("Top Color", pend.top);
@@ -988,13 +1915,54 @@ else if (pend.bgMode == 1)
 {
 pend.solid = EditorGUILayout.ColorField("Color", pend.solid);
 }
+else if (pend.bgMode == 3)
+{
+EditorGUI.BeginChangeCheck();
+Object ao = EditorGUILayout.ObjectField("Video / GIF", LoadAnim(pend.bgAnim), typeof(Object), false);
+if (ao != null) { string ng = AnimGuid(ao); if (ng != null) pend.bgAnim = ng; }
+else if (LoadAnim(pend.bgAnim) != null) pend.bgAnim = "";
+pend.imageFit = EditorGUILayout.Popup("Size", pend.imageFit, new[] { "Fill (cuts the edges)", "Stretch", "Fit Inside" });
+pend.imageTint = EditorGUILayout.ColorField("Tint", pend.imageTint);
+pend.imageDim = EditorGUILayout.Slider("Darkness", pend.imageDim, 0f, 0.9f);
+bool animChanged = EditorGUI.EndChangeCheck();
+pend.liveColors = EditorGUILayout.Toggle(new GUIContent("Live Colors + Frosted Glass", "Boxes become frosted glass and text turns dark or light by itself, following the animation in real time."), pend.liveColors);
+if (!pend.liveColors)
+{
+EditorGUILayout.BeginHorizontal();
+pend.autoImageColors = EditorGUILayout.Toggle("Auto Color Detection", pend.autoImageColors);
+if (GUILayout.Button("Detect Now", GUILayout.Width(90f)))
+{
+Texture df = OuterAIAnimBg.Get(pend.bgAnim);
+if (df != null) { ApplyImageColors(pend, df); GUI.changed = true; }
+}
+EditorGUILayout.EndHorizontal();
+}
+if (animChanged && pend.autoImageColors && !pend.liveColors) animDetect = true;
+if (animDetect && Event.current.type == EventType.Layout && OuterAIAnimBg.Ready(pend.bgAnim))
+{
+animDetect = false;
+ApplyImageColors(pend, OuterAIAnimBg.Get(pend.bgAnim));
+}
+string animErr = OuterAIAnimBg.Error(pend.bgAnim);
+if (animErr != null) EditorGUILayout.HelpBox(animErr, MessageType.Warning);
+else EditorGUILayout.HelpBox(string.IsNullOrEmpty(pend.bgAnim)
+? "Drop a video clip (.mp4 / .mov / .webm) or a .gif from your Project."
+: "Plays small (max 320 px) and only while this window is open. It is freed from memory when you close it.", MessageType.None);
+}
 else
 {
+EditorGUI.BeginChangeCheck();
 pend.bgImage = TexGuid((Texture2D)EditorGUILayout.ObjectField("Image", LoadTex(pend.bgImage), typeof(Texture2D), false));
 pend.imageFit = EditorGUILayout.Popup("Size", pend.imageFit, new[] { "Fill (cuts the edges)", "Stretch", "Fit Inside" });
 if (pend.imageFit == 2) pend.solid = EditorGUILayout.ColorField("Color Behind Image", pend.solid);
 pend.imageTint = EditorGUILayout.ColorField("Tint", pend.imageTint);
 pend.imageDim = EditorGUILayout.Slider("Darkness", pend.imageDim, 0f, 0.9f);
+bool imgChanged = EditorGUI.EndChangeCheck();
+EditorGUILayout.BeginHorizontal();
+pend.autoImageColors = EditorGUILayout.Toggle("Auto Color Detection", pend.autoImageColors);
+if (GUILayout.Button("Detect Now", GUILayout.Width(90f)) && LoadTex(pend.bgImage) != null) { ApplyImageColors(pend, LoadTex(pend.bgImage)); GUI.changed = true; }
+EditorGUILayout.EndHorizontal();
+if (imgChanged && pend.autoImageColors && LoadTex(pend.bgImage) != null) ApplyImageColors(pend, LoadTex(pend.bgImage));
 }
 pend.radius = EditorGUILayout.Slider("Rounded Corners", pend.radius, 0f, 24f);
 if (EditorGUI.EndChangeCheck()) pend.name = "Custom";
@@ -1085,8 +2053,11 @@ catch { }
 }
 EditorGUILayout.EndHorizontal();
 }
+public override bool RequiresConstantRepaint() { return OuterAIThemedEditor.CurrentTheme != null && CurrentTheme.bgMode == 3 && OuterAIAnimBg.Active; }
 protected void OnEnable()
 {
+OuterAIAnimBg.OnFrame += Repaint;
+animOpen = -1; animVals.Clear(); animTarget.Clear();
 LoadPending();
 RefreshFont();
 builtVersion = themeVersion;
@@ -1095,6 +2066,7 @@ OuterAI.CheckAssetLinks();
 }
 protected void OnDisable()
 {
+OuterAIAnimBg.OnFrame -= Repaint;
 if (gradientTexture != null) DestroyImmediate(gradientTexture);
 if (tabOffTex != null) DestroyImmediate(tabOffTex);
 if (tabHoverTex != null) DestroyImmediate(tabHoverTex);
@@ -1121,6 +2093,51 @@ tabOffStyle.normal.textColor = tabOffStyle.hover.textColor = tabOffStyle.active.
 tabOnStyle = new GUIStyle(tabOffStyle) { fontStyle = FontStyle.Bold };
 tabOnStyle.normal.background = tabOnStyle.hover.background = tabOnStyle.active.background = tabOnTex;
 tabOnStyle.normal.textColor = tabOnStyle.hover.textColor = tabOnStyle.active.textColor = Cur.tabTextOn;
+}
+protected int AnimTabs(string[] tabs, int active)
+{
+    int perRow = Mathf.Clamp(Cur.tabsPerRow, 2, 6);
+    Event e = Event.current;
+    ThemeData tc = Tc;
+    if (tabTextStyle == null)
+    {
+        tabTextStyle = new GUIStyle
+        {
+            alignment = TextAnchor.MiddleCenter,
+            font = tabOffStyle.font,
+            fontSize = tabOffStyle.fontSize,
+            padding = new RectOffset(tabOffStyle.padding.left, tabOffStyle.padding.right, tabOffStyle.padding.top, tabOffStyle.padding.bottom),
+            clipping = TextClipping.Clip,
+            wordWrap = false
+        };
+    }
+    for (int i = 0; i < tabs.Length; i++)
+    {
+        if (i % perRow == 0) EditorGUILayout.BeginHorizontal();
+        Rect r = GUILayoutUtility.GetRect(GUIContent.none, tabOffStyle, GUILayout.ExpandWidth(true));
+        if (e.type == EventType.Repaint)
+        {
+            bool hov = r.Contains(e.mousePosition);
+            float h = AnimGet("th" + i, hov ? 1f : 0f);
+            float sel = AnimGet("ts" + i, i == active ? 1f : 0f);
+            Color c = Color.Lerp(Color.Lerp(tc.tabOff, tc.tabHover, h), tc.tabOn, sel);
+            if (Cur.glossy) DrawAeroTab(r, h, sel);
+            else GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, c, 0f, 4f);
+            tabTextStyle.fontStyle = sel > 0.5f ? FontStyle.Bold : FontStyle.Normal;
+            tabTextStyle.normal.textColor = Color.Lerp(tc.tabText, tc.tabTextOn, Mathf.Max(sel, h * 0.6f));
+            tabTextStyle.Draw(r, tabs[i], false, false, false, false);
+            float w = (r.width - 12f) * sel;
+            if (w > 0.5f && !Cur.glossy)
+                GUI.DrawTexture(new Rect(r.center.x - w * 0.5f, r.yMax - 4f, w, 2f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, AColor(Color.Lerp(tc.tabTextOn, IsLive(Cur) ? tc.logo : Color.white, 0.5f), 0.9f), 0f, 1f);
+        }
+        EditorGUIUtility.AddCursorRect(r, MouseCursor.Link);
+        if (e.type == EventType.MouseDown && e.button == 0 && r.Contains(e.mousePosition))
+        {
+            active = i; GUI.changed = true; e.Use();
+        }
+        if (i % perRow == perRow - 1 || i == tabs.Length - 1) EditorGUILayout.EndHorizontal();
+    }
+    return active;
 }
 protected void BuildGradient()
 {
@@ -1256,7 +2273,8 @@ OuterAI.CheckAssetLinks();
 }
 protected void BuildLogo()
 {
-Color l = Cur.logo;
+Color l = Tc.logo;
+logoBuiltCol = l;
 Color b1 = l;
 Color b2 = Color.Lerp(l, Color.white, 0.20f);
 Color h1 = Color.Lerp(l, Color.white, 0.40f);
@@ -1274,8 +2292,10 @@ logoHighText = GradientText(LogoText, h1, h2);
 protected void DrawLogo()
 {
 if (!Cur.showLogo) return;
+{ Color lc = Tc.logo; if (logoStyle != null && Mathf.Abs(lc.r - logoBuiltCol.r) + Mathf.Abs(lc.g - logoBuiltCol.g) + Mathf.Abs(lc.b - logoBuiltCol.b) > 0.04f) logoStyle = null; }
 if (logoStyle == null) BuildLogo();
 Rect rect = GUILayoutUtility.GetRect(GUIContent.none, logoStyle, GUILayout.Height(LogoPx + 12f));
+Rect accent = GUILayoutUtility.GetRect(1f, 4f);
 if (Event.current.type != EventType.Repaint) return;
 if (Cur.logoOutline)
 {
@@ -1291,23 +2311,218 @@ GUI.BeginGroup(new Rect(rect.x, rect.y, rect.width, rect.height * 0.5f));
 GUI.Label(new Rect(0f, 0f, rect.width, rect.height), logoHighText, logoStyle);
 GUI.EndGroup();
 }
+float lineW = accent.width * 0.55f * EaseOut((animElapsed - 0.15f) / 0.6f);
+if (lineW > 0.5f)
+    GUI.DrawTexture(new Rect(accent.center.x - lineW * 0.5f, accent.y - 6f, lineW, 2f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, AColor(Tc.logo, 0.85f), 0f, 1f);
+}
+// ---------------- WINDOWS 7 (AERO) WINDOWS + BUTTONS ----------------
+private readonly HashSet<string> collapsedSections = new HashSet<string>();
+private string pendingToggle;
+private GUIStyle winTitleStyle, capGlyphStyle;
+private static Texture2D aeroBtn, aeroBtnHot, aeroBtnDown;
+private Texture2D[][] aeroSavedScaled; private Texture2D[] aeroSavedBg; private Color[] aeroSavedTc; private RectOffset aeroSavedBorder; private bool aeroPushed;
+
+private static Texture2D MakeAeroTex(Color topA, Color topB, Color botA, Color botB, Color edge)
+{
+    const int N = 32; const float R = 5f;
+    Texture2D t = new Texture2D(N, N, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave, filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
+    Color[] px = new Color[N * N];
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++)
+        {
+            float cx = Mathf.Clamp(x + 0.5f, R, N - R), cy = Mathf.Clamp(y + 0.5f, R, N - R);
+            float inside = R - Vector2.Distance(new Vector2(x + 0.5f, y + 0.5f), new Vector2(cx, cy));
+            float aa = Mathf.Clamp01(inside + 0.5f);
+            float v = y / (N - 1f);
+            Color c = v >= 0.5f ? Color.Lerp(topB, topA, (v - 0.5f) * 2f) : Color.Lerp(botA, botB, (0.5f - v) * 2f);
+            if (inside < 1.3f) c = Color.Lerp(c, edge, 0.95f);                      // dark outer line
+            else if (inside < 2.3f) c = Color.Lerp(c, Color.white, 0.55f);          // white inner line
+            c.a = aa;
+            px[y * N + x] = c;
+        }
+    t.SetPixels(px);
+    t.Apply(false, false);
+    return t;
+}
+private static void EnsureAeroTex()
+{
+    if (aeroBtn != null) return;
+    aeroBtn = MakeAeroTex(new Color(1f, 1f, 1f), new Color(0.88f, 0.94f, 0.99f), new Color(0.76f, 0.87f, 0.96f), new Color(0.86f, 0.94f, 0.99f), new Color(0.36f, 0.46f, 0.58f));
+    aeroBtnHot = MakeAeroTex(new Color(0.95f, 0.99f, 1f), new Color(0.82f, 0.94f, 1f), new Color(0.45f, 0.80f, 1f), new Color(0.72f, 0.96f, 1f), new Color(0.15f, 0.50f, 0.78f));
+    aeroBtnDown = MakeAeroTex(new Color(0.72f, 0.83f, 0.93f), new Color(0.64f, 0.77f, 0.90f), new Color(0.44f, 0.62f, 0.80f), new Color(0.56f, 0.73f, 0.88f), new Color(0.22f, 0.34f, 0.52f));
+}
+private static GUIStyle aeroTabS, aeroTabHotS;
+// Tab drawn like a Windows 7 button: pale glass, glowing cyan when hovered, fully lit when selected.
+private static void DrawAeroTab(Rect r, float hover, float sel)
+{
+    EnsureAeroTex();
+    if (aeroTabS == null || aeroTabS.normal.background == null || aeroTabHotS.normal.background == null)
+    {
+        aeroTabS = new GUIStyle { border = new RectOffset(6, 6, 6, 6) };
+        aeroTabS.normal.background = aeroBtn;
+        aeroTabHotS = new GUIStyle { border = new RectOffset(6, 6, 6, 6) };
+        aeroTabHotS.normal.background = aeroBtnHot;
+    }
+    aeroTabS.Draw(r, GUIContent.none, false, false, false, false);
+    float a = Mathf.Max(hover * 0.85f, sel);
+    if (a > 0.01f)
+    {
+        Color o = GUI.color;
+        GUI.color = new Color(o.r, o.g, o.b, o.a * a);
+        aeroTabHotS.Draw(r, GUIContent.none, false, false, false, false);
+        GUI.color = o;
+    }
+}
+protected void PushAeroButtons()
+{
+    if (aeroPushed) return;
+    EnsureAeroTex();
+    GUIStyle b = GUI.skin.button;
+    GUIStyleState[] st = { b.normal, b.hover, b.active, b.focused };
+    aeroSavedBg = new Texture2D[4]; aeroSavedTc = new Color[4]; aeroSavedScaled = new Texture2D[4][];
+    Color navy = new Color(0.04f, 0.23f, 0.40f);
+    for (int i = 0; i < 4; i++) { aeroSavedBg[i] = st[i].background; aeroSavedTc[i] = st[i].textColor; aeroSavedScaled[i] = st[i].scaledBackgrounds; st[i].textColor = navy; st[i].scaledBackgrounds = new Texture2D[0]; }
+    b.normal.background = aeroBtn; b.hover.background = aeroBtnHot; b.active.background = aeroBtnDown; b.focused.background = aeroBtnHot;
+    aeroSavedBorder = new RectOffset(b.border.left, b.border.right, b.border.top, b.border.bottom);
+    b.border = new RectOffset(6, 6, 6, 6);
+    aeroPushed = true;
+}
+protected void PopAeroButtons()
+{
+    if (!aeroPushed) return;
+    GUIStyle b = GUI.skin.button;
+    GUIStyleState[] st = { b.normal, b.hover, b.active, b.focused };
+    for (int i = 0; i < 4; i++) { st[i].background = aeroSavedBg[i]; st[i].textColor = aeroSavedTc[i]; st[i].scaledBackgrounds = aeroSavedScaled[i]; }
+    b.border = aeroSavedBorder;
+    aeroPushed = false;
+}
+// One of the three caption buttons (minimize / maximize / close) in Windows 7 glass style.
+private void CaptionButton(Rect r, int kind, string key)
+{
+    Event e = Event.current;
+    float h = AnimGet("cap" + key, r.Contains(e.mousePosition) ? 1f : 0f);
+    Color top, bot;
+    if (kind == 2)
+    {
+        top = Color.Lerp(new Color(0.88f, 0.52f, 0.46f), new Color(1f, 0.62f, 0.52f), h);
+        bot = Color.Lerp(new Color(0.68f, 0.17f, 0.11f), new Color(0.92f, 0.20f, 0.10f), h);
+    }
+    else
+    {
+        top = Color.Lerp(new Color(0.90f, 0.95f, 1f), new Color(0.84f, 0.96f, 1f), h);
+        bot = Color.Lerp(new Color(0.55f, 0.72f, 0.88f), new Color(0.28f, 0.80f, 1f), h);
+    }
+    GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, bot, 0f, 3f);
+    top.a = 0.88f;
+    GUI.DrawTexture(new Rect(r.x, r.y, r.width, r.height * 0.5f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, top, 0f, 3f);
+    GUI.DrawTexture(r, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(0.08f, 0.18f, 0.30f, 0.75f), 1f, 3f);
+    GUI.DrawTexture(new Rect(r.x + 1f, r.y + 1f, r.width - 2f, r.height - 2f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, 0.55f), 1f, 2f);
+    Color shadow = new Color(0f, 0.1f, 0.2f, 0.7f);
+    if (kind == 0)
+    {
+        GUI.DrawTexture(new Rect(r.center.x - 4f, r.center.y + 3f, 9f, 3f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, shadow, 0f, 0f);
+        GUI.DrawTexture(new Rect(r.center.x - 5f, r.center.y + 2f, 9f, 3f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Color.white, 0f, 0f);
+    }
+    else if (kind == 1)
+    {
+        GUI.DrawTexture(new Rect(r.center.x - 4f, r.center.y - 3f, 10f, 8f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, shadow, 2f, 0f);
+        GUI.DrawTexture(new Rect(r.center.x - 5f, r.center.y - 4f, 10f, 8f), Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Color.white, 2f, 0f);
+    }
+    else
+    {
+        if (capGlyphStyle == null) capGlyphStyle = new GUIStyle(EditorStyles.boldLabel) { alignment = TextAnchor.MiddleCenter, fontSize = 12 };
+        capGlyphStyle.normal.textColor = shadow;
+        GUI.Label(new Rect(r.x + 1f, r.y + 1f, r.width, r.height), "X", capGlyphStyle);
+        capGlyphStyle.normal.textColor = Color.white;
+        GUI.Label(r, "X", capGlyphStyle);
+    }
+}
+// Windows 7 window caption: glass title bar with glowing title text, caption buttons and a lighter client area.
+private void DrawWindowTitle(string title, Rect box)
+{
+    Event e = Event.current;
+    Rect tb = GUILayoutUtility.GetRect(1f, 26f, GUILayout.ExpandWidth(true));
+    bool collapsed = collapsedSections.Contains(title);
+    Rect close = new Rect(tb.xMax - 4f - 42f, tb.y + 1f, 42f, 18f);
+    Rect max = new Rect(close.x - 27f, tb.y + 1f, 27f, 18f);
+    Rect min = new Rect(max.x - 27f, tb.y + 1f, 27f, 18f);
+    if (e.type == EventType.Repaint)
+    {
+        GUI.DrawTexture(tb, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, 0.55f), 0f, 4f);
+        DrawGloss(tb, 0.16f, 4f);
+        if (!collapsed && box.yMax - tb.yMax > 10f)
+        {
+            float ca = 0.62f;
+            Rect cl = new Rect(box.x + 4f, tb.yMax + 2f, box.width - 8f, box.yMax - tb.yMax - 6f);
+            GUI.DrawTexture(cl, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(1f, 1f, 1f, ca), 0f, 2f);
+            GUI.DrawTexture(cl, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, new Color(0.05f, 0.25f, 0.45f, 0.35f), 1f, 2f);
+        }
+        if (winTitleStyle == null) winTitleStyle = new GUIStyle(sectionTitleStyle);
+        winTitleStyle.font = sectionTitleStyle.font; winTitleStyle.fontSize = sectionTitleStyle.fontSize;
+        winTitleStyle.alignment = TextAnchor.MiddleLeft;
+        Rect tr = new Rect(tb.x + 10f, tb.y, Mathf.Max(10f, min.x - tb.x - 14f), tb.height);
+        Color tc = Tc.titleColor;
+        if ((tc.r + tc.g + tc.b) / 3f < 0.5f)       // dark text gets the white Aero glow
+        {
+            winTitleStyle.normal.textColor = new Color(1f, 1f, 1f, 0.85f);
+            for (int i = 0; i < 4; i++)
+            {
+                float ox = (i % 2 == 0) ? (i == 0 ? -1f : 1f) : 0f, oy = (i % 2 == 1) ? (i == 1 ? -1f : 1f) : 0f;
+                GUI.Label(new Rect(tr.x + ox, tr.y + oy, tr.width, tr.height), title, winTitleStyle);
+            }
+        }
+        winTitleStyle.normal.textColor = tc;
+        GUI.Label(tr, title, winTitleStyle);
+        CaptionButton(min, 0, title + "m");
+        CaptionButton(max, 1, title + "x");
+        CaptionButton(close, 2, title + "c");
+    }
+    if (e.type == EventType.MouseDown && e.button == 0)
+    {
+        if (min.Contains(e.mousePosition) || (collapsed && max.Contains(e.mousePosition)))
+        {
+            pendingToggle = title; e.Use(); Repaint();      // minimize folds the window up, maximize opens it again
+        }
+    }
 }
 protected void DrawSection(string title, System.Action contents)
 {
 Rect box = EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-if (Event.current.type == EventType.Repaint && Cur.boxColor.a > 0.001f)
-GUI.DrawTexture(box, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Cur.boxColor, 0f, 4f);
+if (Event.current.type == EventType.Repaint)
+{
+    if (IsLive(Cur)) DrawGlass(box);
+    else
+    {
+        if (Cur.boxColor.a > 0.001f) GUI.DrawTexture(box, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Cur.boxColor, 0f, 4f);
+        if (Cur.glossy) DrawGloss(box, 0.20f, 4f);
+    }
+}
 GUILayout.Space(2);
+Color secOld = GUI.color;
+float secIn = EaseOut((animElapsed - 0.06f - animSection * 0.045f) / 0.28f);
+animSection++;
+if (secIn < 1f) { GUI.color = new Color(secOld.r, secOld.g, secOld.b, secOld.a * secIn); Repaint(); }
+if (Event.current.type == EventType.Repaint)
+{
+    float gl = AnimGet("sec" + title, box.Contains(Event.current.mousePosition) ? 1f : 0f);
+    if (gl > 0.01f) GUI.DrawTexture(box, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, AColor(Tc.titleColor, 0.28f * gl), 1f, 4f);
+}
 if (sectionTitleStyle == null)
 {
 sectionTitleStyle = new GUIStyle(EditorStyles.boldLabel) { alignment = Cur.titleCenter ? TextAnchor.MiddleCenter : TextAnchor.MiddleLeft, fontSize = Cur.titleSize };
 if (curUiFont != null) sectionTitleStyle.font = curUiFont;
 sectionTitleStyle.normal.textColor = Cur.titleColor;
 }
-GUILayout.Label(title, sectionTitleStyle, GUILayout.Height(24f));
-GUILayout.Space(3);
-contents();
-GUILayout.Space(2);
+sectionTitleStyle.normal.textColor = Tc.titleColor;
+if (Cur.glossy) DrawWindowTitle(title, box);
+else GUILayout.Label(title, sectionTitleStyle, GUILayout.Height(24f));
+if (!(Cur.glossy && collapsedSections.Contains(title)))
+{
+    GUILayout.Space(3);
+    contents();
+    GUILayout.Space(2);
+}
+GUI.color = secOld;
 EditorGUILayout.EndVertical();
 }
 protected void DrawList(string propName, string label)
@@ -1339,14 +2554,14 @@ foreach (string n in names) EditorGUILayout.PropertyField(serializedObject.FindP
 }
 protected GUIStyle[] darkStyles;
 protected Color[] darkBackup;
-protected void PushDarkText()
+protected void PushDarkText() { PushTextColor(new Color(0.07f, 0.07f, 0.10f)); }
+protected void PushTextColor(Color dark)
 {
 GUIStyle[] st = { EditorStyles.label, EditorStyles.miniLabel, EditorStyles.miniBoldLabel, EditorStyles.boldLabel,
 EditorStyles.wordWrappedLabel, EditorStyles.wordWrappedMiniLabel, EditorStyles.toggle, EditorStyles.foldout,
 GUI.skin.label, GUI.skin.toggle };
 darkStyles = st;
 darkBackup = new Color[st.Length * 8];
-Color dark = new Color(0.07f, 0.07f, 0.10f);
 for (int i = 0; i < st.Length; i++)
 {
 GUIStyleState[] states = { st[i].normal, st[i].hover, st[i].active, st[i].focused, st[i].onNormal, st[i].onHover, st[i].onActive, st[i].onFocused };
@@ -1377,10 +2592,14 @@ return r;
 }
 internal void DrawThemesPanel()
 {
+Color colOld = GUI.color;
+TickAnim();
 Font oldFont = GUI.skin.font;
 if (curUiFont != null) GUI.skin.font = curUiFont;
-bool darkText = LightBg(Cur);
-if (darkText) PushDarkText();
+bool darkText = LightBg(Cur) || IsLive(Cur) || Cur.glossy;
+if (darkText) { if (IsLive(Cur) || Cur.glossy) PushTextColor(Tc.titleColor); else PushDarkText(); }
+bool aero = Cur.glossy;
+if (aero) PushAeroButtons();
 try
 {
 if (builtVersion != themeVersion)
@@ -1394,19 +2613,24 @@ if (backgroundStyle == null) backgroundStyle = new GUIStyle { padding = new Rect
 Rect bg = EditorGUILayout.BeginVertical(backgroundStyle);
 if (Event.current.type == EventType.Repaint)
 {
-if (Cur.bgMode == 2 && curBg != null) DrawImage(bg, curBg, Cur);
+liveBgRect = bg;
+Texture animTex = BgTex(Cur);
+if (animTex != null) DrawImage(bg, animTex, Cur);
 else GUI.DrawTexture(bg, gradientTexture, ScaleMode.StretchToFill, true, 0f, Color.white, 0f, Cur.radius);
 if (Cur.borderWidth > 0)
 GUI.DrawTexture(bg, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Cur.borderColor, Cur.borderWidth, Cur.radius);
 }
 GUILayout.Space(6);
+BeginFade();
 DrawTheme();
 EditorGUILayout.EndVertical();
 }
 finally
 {
 if (darkText) PopDarkText();
+if (aero) PopAeroButtons();
 GUI.skin.font = oldFont;
+GUI.color = colOld;
 }
 }
 public override void OnInspectorGUI()
@@ -1414,17 +2638,23 @@ public override void OnInspectorGUI()
 if (OuterAITos.Blocked) { OuterAITos.DrawBlocked(); return; }
 Font oldFont = GUI.skin.font;
 if (curUiFont != null) GUI.skin.font = curUiFont;
-bool darkText = LightBg(Cur);
-if (darkText) PushDarkText();
+bool darkText = LightBg(Cur) || IsLive(Cur) || Cur.glossy;
+if (darkText) { if (IsLive(Cur) || Cur.glossy) PushTextColor(Tc.titleColor); else PushDarkText(); }
+bool aero = Cur.glossy;
+if (aero) PushAeroButtons();
+Color colOld = GUI.color;
 try { DrawMain(); }
 finally
 {
 if (darkText) PopDarkText();
+if (aero) PopAeroButtons();
 GUI.skin.font = oldFont;
+GUI.color = colOld;
 }
 }
 protected void DrawMain()
 {
+TickAnim();
 serializedObject.Update();
 if (builtVersion != themeVersion)
 {
@@ -1437,12 +2667,15 @@ if (backgroundStyle == null) backgroundStyle = new GUIStyle { padding = new Rect
 Rect bg = EditorGUILayout.BeginVertical(backgroundStyle);
 if (Event.current.type == EventType.Repaint)
 {
-if (Cur.bgMode == 2 && curBg != null) DrawImage(bg, curBg, Cur);
+liveBgRect = bg;
+Texture animTex = BgTex(Cur);
+if (animTex != null) DrawImage(bg, animTex, Cur);
 else GUI.DrawTexture(bg, gradientTexture, ScaleMode.StretchToFill, true, 0f, Color.white, 0f, Cur.radius);
 if (Cur.borderWidth > 0)
 GUI.DrawTexture(bg, Texture2D.whiteTexture, ScaleMode.StretchToFill, true, 0f, Cur.borderColor, Cur.borderWidth, Cur.radius);
 }
 GUILayout.Space(9);
+BeginFade();
 DrawLogo();
 if (subStyle == null)
 {
@@ -1450,6 +2683,7 @@ subStyle = new GUIStyle { alignment = TextAnchor.MiddleCenter, fontSize = Cur.su
 if (curUiFont != null) subStyle.font = curUiFont;
 subStyle.normal.textColor = Cur.sub;
 }
+subStyle.normal.textColor = Tc.sub;
 GUILayout.Label("Public free horror AI made by outer, no credits needed :)", subStyle);
 GUILayout.Space(12);
 DrawBody();
@@ -1467,14 +2701,7 @@ protected override void DrawBody()
 OuterAI script = (OuterAI)target;
 string[] tabs = { "Main", "Movement", "Sight & Hearing", "Jumpscare", "Extras", "Anti Lag" };
 if (script.ActiveInspectorTab >= tabs.Length || script.ActiveInspectorTab < 0) script.ActiveInspectorTab = 0;
-int perRow = Mathf.Clamp(Cur.tabsPerRow, 2, 6);
-for (int i = 0; i < tabs.Length; i++)
-{
-if (i % perRow == 0) EditorGUILayout.BeginHorizontal();
-if (GUILayout.Button(tabs[i], i == script.ActiveInspectorTab ? tabOnStyle : tabOffStyle))
-script.ActiveInspectorTab = i;
-if (i % perRow == perRow - 1 || i == tabs.Length - 1) EditorGUILayout.EndHorizontal();
-}
+script.ActiveInspectorTab = AnimTabs(tabs, script.ActiveInspectorTab);
 GUILayout.Space(10);
 switch (script.ActiveInspectorTab)
 {
@@ -1691,14 +2918,7 @@ public class OuterAIManagerEditor : OuterAIThemedEditor
         List<OuterAI> t = m.TickedMonsters();
 
         if (m.ActiveInspectorTab < 0 || m.ActiveInspectorTab >= Tabs.Length) m.ActiveInspectorTab = 0;
-        int perRow = Mathf.Clamp(Cur.tabsPerRow, 2, 6);
-        for (int i = 0; i < Tabs.Length; i++)
-        {
-            if (i % perRow == 0) EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button(Tabs[i], i == m.ActiveInspectorTab ? tabOnStyle : tabOffStyle))
-                m.ActiveInspectorTab = i;
-            if (i % perRow == perRow - 1 || i == Tabs.Length - 1) EditorGUILayout.EndHorizontal();
-        }
+        m.ActiveInspectorTab = AnimTabs(Tabs, m.ActiveInspectorTab);
         GUILayout.Space(10);
 
         OuterAISetupEngine.pingOnly = true;
@@ -2085,8 +3305,8 @@ public class OuterAIManagerWindow : EditorWindow
         w.Show();
     }
 
-    private void OnEnable() { Find(); }
-    private void OnDisable() { if (inner != null) DestroyImmediate(inner); inner = null; }
+    private void OnEnable() { Find(); OuterAIAnimBg.OnFrame += Repaint; }
+    private void OnDisable() { OuterAIAnimBg.OnFrame -= Repaint; if (inner != null) DestroyImmediate(inner); inner = null; }
     private void OnHierarchyChange() { if (target == null) Find(); Repaint(); }
     private void OnSelectionChange() { Repaint(); }
 
@@ -2116,6 +3336,7 @@ public class OuterAIManagerWindow : EditorWindow
 
     private void OnGUI()
     {
+        if (OuterAIAnimBg.Active && Event.current.type == EventType.Repaint) Repaint();
         if (OuterAITos.Blocked) { GUILayout.Space(10f); OuterAITos.DrawBlocked(); return; }
         if (target == null) Find();
         if (target == null)
