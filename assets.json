@@ -13,11 +13,11 @@
     {
       "id": "better-playfab-login",
       "name": "Better PlayFab Login",
-      "version": "1.0",
+      "version": "1.1",
       "author": "outer0_0",
       "description": "A better PlayFab login for your project",
-      "package": "Packages/BetterPlayFabLogin.unitypackage",
-      "sha256": "",
+      "package": "Packages/better-playfab-login.unitypackage",
+      "sha256": "f977721bad7ce98b44405be5b9d67a7c5ba564b5ff74ca24efc85611cb87e56c",
       "folder": "Outer assets/Better PlayFab Login"
     }
   ]
