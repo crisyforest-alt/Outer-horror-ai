@@ -1,0 +1,24 @@
+{
+  "assets": [
+    {
+      "id": "outer-horror-ai",
+      "name": "Outer Horror AI",
+      "version": "1.0",
+      "author": "outer0_0",
+      "description": "The free horror AI: monsters that see, hear, chase and jumpscare, with auto setup and a built-in checker.",
+      "package": "Packages/OuterHorrorAI.unitypackage",
+      "sha256": "",
+      "folder": "Outer assets/Outer Horror AI"
+    },
+    {
+      "id": "better-playfab-login",
+      "name": "Better PlayFab Login",
+      "version": "1.0",
+      "author": "outer0_0",
+      "description": "A better PlayFab login for your project.",
+      "package": "Packages/BetterPlayFabLogin.unitypackage",
+      "sha256": "",
+      "folder": "Outer assets/Better PlayFab Login"
+    }
+  ]
+}
